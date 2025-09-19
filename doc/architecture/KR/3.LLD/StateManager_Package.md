@@ -56,7 +56,21 @@ package의 state는 package에 포함된 model들의 상태가 package의 특정
 
 - **인터페이스:** 외부 인터페이스(gRPC)로부터 수신, 외부 인터페이스(ETCD)로 발신
 
-## 4. etcd로 put, get 하는 방법
+## 4. 구현 규칙
+
+이 문서를 기반으로 구현할 경우 반드시 따라야 하는 구현 규칙은 다음과 같다. 
+
+### 4.1 state 변경 기능의 구현 위치 규칙
+
+아래 로직은 state_machine.rs 파일 내 StateMachine 구현 블록 내에 구현되어야 한다. 
+
+**조건:** `<container, state>` 리스트가 model의 특정 state 조건과 일치하면 model의 state를 변경
+**구현위치:** pub struct StateMachine 구조체의 impl StateMachine 구현 블록에 구현되어야 함
+
+
+### 4.2 etcd로 put, get 하는 방법 규칙 
+etcd에 값을 저장(put)하거나 조회(get)할 때는 문서에 제시된 예시 코드의 지정된 key/value 포맷대로 작성해야 한다. 
+
 예시1 : package의 state put 시 
 ```
 let key = format!("/package/{}/state", package_name);
