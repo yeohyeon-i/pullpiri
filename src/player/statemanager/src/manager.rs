@@ -434,7 +434,24 @@ impl StateManagerManager {
         println!("  Node Name: {}", container_list.node_name);
         println!("  Container Count: {}", container_list.containers.len());
 
-        // Process each container for health status analysis
+        // Process model state changes based on container states
+        let mut state_machine = self.state_machine.lock().await;
+        let model_state_updates = state_machine
+            .process_container_list_for_models(&container_list)
+            .await;
+
+        if !model_state_updates.is_empty() {
+            println!("  Model State Updates Detected:");
+            for (model_name, new_state) in &model_state_updates {
+                println!("    Model '{}' -> {:?}", model_name, new_state);
+            }
+
+            // Process package state updates based on model state changes
+            self.process_package_state_updates_from_models(&model_state_updates)
+                .await;
+        }
+
+        // Process each container for detailed health status analysis
         for (i, container) in container_list.containers.iter().enumerate() {
             // container.names is a Vec<String>, so join them for display
             let container_names = container.names.join(", ");
@@ -453,40 +470,195 @@ impl StateManagerManager {
                 println!("    Annotations: {:?}", container.annotation);
             }
 
-            // TODO: Implement comprehensive container processing:
-            //
-            // 1. HEALTH STATUS ANALYSIS
-            //    - Analyze container state changes (running -> failed, etc.)
-            //    - Check exit codes for failure conditions
-            //    - Monitor resource usage and performance metrics
-            //    - Detect container restart loops and crash patterns
-            //
-            // 2. RESOURCE MAPPING
-            //    - Map containers to managed resources (scenarios, packages, models)
-            //    - Identify which resources are affected by container changes
-            //    - Determine impact on dependent resources
-            //
-            // 3. STATE TRANSITION TRIGGERS
-            //    - Trigger state transitions for failed containers
-            //    - Handle container recovery and restart scenarios
-            //    - Update resource states based on container health
-            //    - Escalate to recovery management for critical failures
-            //
-            // 4. HEALTH STATUS UPDATES
-            //    - Update resource health status based on container state
-            //    - Generate health check events and notifications
-            //    - Update monitoring and observability data
-            //    - Maintain health history for trend analysis
-            //
-            // 5. ASIL COMPLIANCE MONITORING
-            //    - Monitor ASIL-critical containers for safety violations
-            //    - Generate alerts for safety-critical container failures
-            //    - Implement timing constraints for container recovery
-            //    - Ensure safety systems remain operational
+            // Analyze container health and perform additional processing
+            self.analyze_container_health(container).await;
         }
 
-        println!("  Status: Container list processing completed (implementation pending)");
+        println!("  Status: Container list processing completed");
         println!("=====================================");
+    }
+
+    /// Analyze individual container health and state changes
+    async fn analyze_container_health(&self, container: &common::monitoringserver::ContainerInfo) {
+        // Extract container state information
+        let container_state = container
+            .state
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Check for problematic states
+        match container_state.to_lowercase().as_str() {
+            "dead" | "failed" | "error" => {
+                println!(
+                    "    WARNING: Container {} in problematic state: {}",
+                    container.names.join(","),
+                    container_state
+                );
+                // TODO: Trigger alerts and recovery procedures
+            }
+            "exited" | "stopped" => {
+                println!(
+                    "    INFO: Container {} has stopped: {}",
+                    container.names.join(","),
+                    container_state
+                );
+                // TODO: Check if this is expected or requires intervention
+            }
+            "running" | "started" => {
+                // Normal operation - could add performance monitoring here
+            }
+            _ => {
+                println!(
+                    "    INFO: Container {} in state: {}",
+                    container.names.join(","),
+                    container_state
+                );
+            }
+        }
+
+        // Monitor resource usage if available
+        if !container.stats.is_empty() {
+            println!("    Resource Stats: {:?}", container.stats);
+            // TODO: Implement resource usage monitoring and alerting
+        }
+    }
+
+    /// Process package state updates based on model state changes
+    ///
+    /// According to the documentation, package states should be updated when
+    /// constituent model states change according to these rules:
+    /// - idle: 맨 처음 package의 상태 (생성 시 기본 상태)
+    /// - paused: 모든 model이 paused 상태일 때
+    /// - exited: 모든 model이 exited 상태일 때
+    /// - degraded: 일부 model이 dead 상태일 때 (일부(1개 이상) model이 dead 상태, 단 모든 model이 dead가 아닐 때)
+    /// - error: 모든 model이 dead 상태일 때
+    /// - running: 위 조건을 모두 만족하지 않을 때(기본 상태)
+    async fn process_package_state_updates_from_models(
+        &self,
+        model_state_updates: &[(String, common::statemanager::ModelState)],
+    ) {
+        // Group models by their parent package
+        let mut package_models: std::collections::HashMap<
+            String,
+            Vec<(String, common::statemanager::ModelState)>,
+        > = std::collections::HashMap::new();
+
+        for (model_name, model_state) in model_state_updates {
+            // Extract package name from model name (assuming naming convention: package_name-model_name)
+            let package_name = if let Some(pos) = model_name.find('-') {
+                model_name[..pos].to_string()
+            } else {
+                // If no separator found, use the model name as package name
+                model_name.clone()
+            };
+
+            package_models
+                .entry(package_name)
+                .or_insert_with(Vec::new)
+                .push((model_name.clone(), *model_state));
+        }
+
+        // Evaluate and update package states
+        for (package_name, models) in package_models {
+            let new_package_state = self.evaluate_package_state_from_models(&models).await;
+
+            // Persist package state to etcd
+            if let Err(e) = self
+                .persist_package_state_to_etcd(&package_name, new_package_state)
+                .await
+            {
+                eprintln!(
+                    "Failed to persist package {} state to etcd: {:?}",
+                    package_name, e
+                );
+            } else {
+                println!(
+                    "  Package '{}' state updated to {:?}",
+                    package_name, new_package_state
+                );
+            }
+        }
+    }
+
+    /// Evaluate package state based on constituent model states
+    async fn evaluate_package_state_from_models(
+        &self,
+        models: &[(String, common::statemanager::ModelState)],
+    ) -> PackageState {
+        if models.is_empty() {
+            return PackageState::Initializing; // Map "idle" to Initializing
+        }
+
+        let mut all_paused = true;
+        let mut all_exited = true;
+        let mut all_failed = true;
+        let mut has_failed = false;
+
+        for (_, model_state) in models {
+            match model_state {
+                common::statemanager::ModelState::Unknown => {
+                    // Maps to "Paused"
+                    all_exited = false;
+                    all_failed = false;
+                }
+                common::statemanager::ModelState::Succeeded => {
+                    // Maps to "Exited"
+                    all_paused = false;
+                    all_failed = false;
+                }
+                common::statemanager::ModelState::Failed => {
+                    // Maps to "Dead"
+                    has_failed = true;
+                    all_paused = false;
+                    all_exited = false;
+                }
+                _ => {
+                    all_paused = false;
+                    all_exited = false;
+                    all_failed = false;
+                }
+            }
+        }
+
+        // Apply package state rules from documentation
+        if all_failed {
+            PackageState::Error
+        } else if has_failed {
+            PackageState::Degraded
+        } else if all_paused {
+            PackageState::Paused
+        } else if all_exited {
+            // Note: Using Running instead of a non-existent Exited state
+            PackageState::Running
+        } else {
+            PackageState::Running
+        }
+    }
+
+    /// Persist package state to etcd following documentation format
+    async fn persist_package_state_to_etcd(
+        &self,
+        package_name: &str,
+        state: PackageState,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let key = format!("/package/{}/state", package_name);
+        let value = match state {
+            PackageState::Initializing => "idle", // Map to documentation "idle"
+            PackageState::Paused => "paused",
+            PackageState::Running => "running",
+            PackageState::Degraded => "degraded",
+            PackageState::Error => "error",
+            _ => "unknown",
+        };
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            eprintln!("Failed to save package state to etcd: {:?}", e);
+            return Err(Box::new(e));
+        }
+
+        Ok(())
     }
 
     /// Main message processing loop for handling gRPC requests.

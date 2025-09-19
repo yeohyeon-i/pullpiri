@@ -664,6 +664,265 @@ impl StateMachine {
     }
 
     // ========================================
+    // MODEL STATE EVALUATION FROM CONTAINERS
+    // ========================================
+
+    /// Evaluate model state based on container states according to Korean documentation
+    ///
+    /// Implementation follows the state transition conditions defined in
+    /// `doc/architecture/KR/3.LLD/StateManager_Model.md` section 4.2:
+    /// - Created: model의 최초 상태 (생성 시 기본 상태)
+    /// - Paused: 모든 container가 paused 상태일 때
+    /// - Exited: 모든 container가 exited 상태일 때  
+    /// - Dead: 하나 이상의 container가 dead 상태이거나, model 정보 조회 실패
+    /// - Running: 위 조건을 모두 만족하지 않을 때(기본 상태)
+    ///
+    /// # Parameters
+    /// * `model_name` - Name of the model to evaluate
+    /// * `container_states` - Map of container states from container list
+    ///
+    /// # Returns
+    /// * `ModelState` - The determined model state based on container conditions
+    pub fn evaluate_model_state_from_containers(
+        &self,
+        model_name: &str,
+        container_states: &std::collections::HashMap<String, String>,
+    ) -> ModelState {
+        if container_states.is_empty() {
+            return ModelState::Pending; // Map "Created" to Pending
+        }
+
+        let mut all_paused = true;
+        let mut all_exited = true;
+        let mut has_dead = false;
+        let mut _has_running = false;
+
+        // Analyze each container state for the model
+        for (container_name, state) in container_states {
+            // Skip containers that don't belong to this model
+            if !container_name.contains(model_name) {
+                continue;
+            }
+
+            match state.to_lowercase().as_str() {
+                "paused" => {
+                    all_exited = false;
+                }
+                "exited" | "stopped" => {
+                    all_paused = false;
+                }
+                "dead" | "failed" | "error" => {
+                    has_dead = true;
+                    all_paused = false;
+                    all_exited = false;
+                }
+                "running" | "started" => {
+                    _has_running = true;
+                    all_paused = false;
+                    all_exited = false;
+                }
+                _ => {
+                    // Unknown state treated as not paused/exited
+                    all_paused = false;
+                    all_exited = false;
+                }
+            }
+        }
+
+        // Apply state transition rules from documentation
+        // Map to existing protocol buffer states
+        if has_dead {
+            ModelState::Failed // Map "Dead" to Failed
+        } else if all_paused {
+            ModelState::Unknown // Map "Paused" to Unknown (temporary)
+        } else if all_exited {
+            ModelState::Succeeded // Map "Exited" to Succeeded
+        } else {
+            // Default state when no specific conditions are met
+            ModelState::Running
+        }
+    }
+
+    /// Process container list to determine model state changes
+    ///
+    /// Analyzes the container list from NodeAgent and evaluates which models
+    /// need state updates based on their container conditions.
+    ///
+    /// # Parameters
+    /// * `container_list` - Container list from NodeAgent
+    ///
+    /// # Returns
+    /// * `Vec<(String, ModelState)>` - List of models that need state updates
+    pub async fn process_container_list_for_models(
+        &mut self,
+        container_list: &common::monitoringserver::ContainerList,
+    ) -> Vec<(String, ModelState)> {
+        let mut model_state_updates = Vec::new();
+        let mut model_containers: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = std::collections::HashMap::new();
+
+        // Group containers by model based on annotations or naming convention
+        for container in &container_list.containers {
+            // Extract model name from container annotation or name
+            let model_name = self.extract_model_name_from_container(container);
+
+            if let Some(model_name) = model_name {
+                let container_states = model_containers
+                    .entry(model_name.clone())
+                    .or_insert_with(std::collections::HashMap::new);
+
+                // Get container state - use the first state entry if multiple exist
+                let container_state = container
+                    .state
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                container_states.insert(container.id.clone(), container_state);
+            }
+        }
+
+        // Evaluate state for each model
+        for (model_name, container_states) in model_containers {
+            let new_state =
+                self.evaluate_model_state_from_containers(&model_name, &container_states);
+
+            // Check if state has changed from current state
+            let current_state = self.get_current_model_state(&model_name);
+            if current_state != new_state {
+                model_state_updates.push((model_name.clone(), new_state));
+
+                // Update internal state tracking
+                self.update_model_state(&model_name, new_state);
+
+                // Persist to etcd
+                if let Err(e) = self
+                    .persist_model_state_to_etcd(&model_name, new_state)
+                    .await
+                {
+                    eprintln!(
+                        "Failed to persist model {} state to etcd: {:?}",
+                        model_name, e
+                    );
+                }
+            }
+        }
+
+        model_state_updates
+    }
+
+    /// Extract model name from container information
+    ///
+    /// Uses container annotations or naming conventions to identify which model
+    /// a container belongs to.
+    ///
+    /// # Parameters  
+    /// * `container` - Container information from container list
+    ///
+    /// # Returns
+    /// * `Option<String>` - Model name if identifiable, None otherwise
+    fn extract_model_name_from_container(
+        &self,
+        container: &common::monitoringserver::ContainerInfo,
+    ) -> Option<String> {
+        // Check container annotations for model name
+        if let Some(model_name) = container.annotation.get("pullpiri.model") {
+            return Some(model_name.clone());
+        }
+
+        // Check container config for model name
+        if let Some(model_name) = container.config.get("model") {
+            return Some(model_name.clone());
+        }
+
+        // Extract from container name using naming convention
+        // Assumes containers are named like: <model_name>-<suffix>
+        for name in &container.names {
+            if let Some(model_name) = name.split('-').next() {
+                if !model_name.is_empty() && model_name != "pod" && model_name != "container" {
+                    return Some(model_name.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get current model state from internal tracking
+    fn get_current_model_state(&self, model_name: &str) -> ModelState {
+        if let Some(resource_state) = self.resource_states.get(model_name) {
+            // Convert i32 state back to ModelState enum
+            match resource_state.current_state {
+                s if s == ModelState::Pending as i32 => ModelState::Pending,
+                s if s == ModelState::Unknown as i32 => ModelState::Unknown,
+                s if s == ModelState::Succeeded as i32 => ModelState::Succeeded,
+                s if s == ModelState::Failed as i32 => ModelState::Failed,
+                s if s == ModelState::Running as i32 => ModelState::Running,
+                _ => ModelState::Pending, // Default fallback
+            }
+        } else {
+            ModelState::Pending // Default for new models
+        }
+    }
+
+    /// Update internal model state tracking
+    fn update_model_state(&mut self, model_name: &str, new_state: ModelState) {
+        let resource_state = self
+            .resource_states
+            .entry(model_name.to_string())
+            .or_insert_with(|| crate::types::ResourceState {
+                resource_type: ResourceType::Model,
+                resource_name: model_name.to_string(),
+                current_state: ModelState::Pending as i32,
+                desired_state: None,
+                last_transition_time: tokio::time::Instant::now(),
+                transition_count: 0,
+                metadata: std::collections::HashMap::new(),
+                health_status: crate::types::HealthStatus {
+                    healthy: true,
+                    status_message: "Model state updated".to_string(),
+                    last_check: tokio::time::Instant::now(),
+                    consecutive_failures: 0,
+                },
+            });
+
+        resource_state.current_state = new_state as i32;
+        resource_state.last_transition_time = tokio::time::Instant::now();
+        resource_state.transition_count += 1;
+    }
+
+    /// Persist model state to etcd following the documentation format
+    ///
+    /// Uses the format specified in section 5 of StateManager_Model.md:
+    /// - Key: `/model/{model_name}/state`
+    /// - Value: state name as string (e.g., "Running")
+    async fn persist_model_state_to_etcd(
+        &self,
+        model_name: &str,
+        state: ModelState,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let key = format!("/model/{}/state", model_name);
+        let value = match state {
+            ModelState::Pending => "Pending", // Maps to "Created" from documentation
+            ModelState::Unknown => "Paused",  // Maps to "Paused" from documentation
+            ModelState::Succeeded => "Exited", // Maps to "Exited" from documentation
+            ModelState::Failed => "Dead",     // Maps to "Dead" from documentation
+            ModelState::Running => "Running",
+            _ => "Unknown",
+        };
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            eprintln!("Failed to save model state to etcd: {:?}", e);
+            return Err(Box::new(e));
+        }
+
+        Ok(())
+    }
+
+    // ========================================
     // VALIDATION AND UTILITY METHODS
     // ========================================
 
@@ -1210,5 +1469,111 @@ impl StateMachine {
 impl Default for StateMachine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_evaluate_model_state_from_containers_empty() {
+        let state_machine = StateMachine::new();
+        let container_states = HashMap::new();
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Pending); // Should map to "Created" from documentation
+    }
+
+    #[test]
+    fn test_evaluate_model_state_from_containers_all_running() {
+        let state_machine = StateMachine::new();
+        let mut container_states = HashMap::new();
+        container_states.insert("test_model_container1".to_string(), "running".to_string());
+        container_states.insert("test_model_container2".to_string(), "running".to_string());
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Running);
+    }
+
+    #[test] 
+    fn test_evaluate_model_state_from_containers_all_paused() {
+        let state_machine = StateMachine::new();
+        let mut container_states = HashMap::new();
+        container_states.insert("test_model_container1".to_string(), "paused".to_string());
+        container_states.insert("test_model_container2".to_string(), "paused".to_string());
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Unknown); // Maps to "Paused" from documentation
+    }
+
+    #[test]
+    fn test_evaluate_model_state_from_containers_all_exited() {
+        let state_machine = StateMachine::new();
+        let mut container_states = HashMap::new();
+        container_states.insert("test_model_container1".to_string(), "exited".to_string());
+        container_states.insert("test_model_container2".to_string(), "stopped".to_string());
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Succeeded); // Maps to "Exited" from documentation
+    }
+
+    #[test]
+    fn test_evaluate_model_state_from_containers_has_dead() {
+        let state_machine = StateMachine::new();
+        let mut container_states = HashMap::new();
+        container_states.insert("test_model_container1".to_string(), "running".to_string());
+        container_states.insert("test_model_container2".to_string(), "dead".to_string());
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Failed); // Maps to "Dead" from documentation
+    }
+
+    #[test]
+    fn test_evaluate_model_state_from_containers_mixed_states() {
+        let state_machine = StateMachine::new();
+        let mut container_states = HashMap::new();
+        container_states.insert("test_model_container1".to_string(), "running".to_string());
+        container_states.insert("test_model_container2".to_string(), "paused".to_string());
+        
+        let result = state_machine.evaluate_model_state_from_containers("test_model", &container_states);
+        assert_eq!(result, ModelState::Running); // Default when conditions don't match
+    }
+
+    #[test]
+    fn test_extract_model_name_from_container_annotation() {
+        let state_machine = StateMachine::new();
+        let mut container = common::monitoringserver::ContainerInfo {
+            id: "test_id".to_string(),
+            names: vec!["test_container".to_string()],
+            image: "test_image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        
+        container.annotation.insert("pullpiri.model".to_string(), "my_model".to_string());
+        
+        let result = state_machine.extract_model_name_from_container(&container);
+        assert_eq!(result, Some("my_model".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_name_from_container_name() {
+        let state_machine = StateMachine::new();
+        let container = common::monitoringserver::ContainerInfo {
+            id: "test_id".to_string(),
+            names: vec!["my_model-worker".to_string()],
+            image: "test_image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        
+        let result = state_machine.extract_model_name_from_container(&container);
+        assert_eq!(result, Some("my_model".to_string()));
     }
 }
