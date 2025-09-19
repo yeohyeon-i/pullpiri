@@ -1,6 +1,23 @@
 use common::statemanager::{ErrorCode, ResourceType};
 use std::collections::HashMap;
 use tokio::time::Instant;
+
+// ========================================
+// CONTAINER STATE DEFINITIONS
+// ========================================
+
+/// Container state enum according to documentation requirements
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContainerState {
+    Created, // 컨테이너가 생성되지 않았거나 모두 삭제된 경우
+    Running, // 하나 이상의 컨테이너가 실행 중
+    Stopped, // 하나 이상의 컨테이너가 중지, 실행 중인 컨테이너는 없음
+    Exited,  // Pod 내 모든 컨테이너가 종료된 상태
+    Dead,    // Pod의 상태 정보를 가져오는 데 실패한 경우
+    Paused,  // 컨테이너가 일시정지된 상태
+    Unknown, // 상태를 알 수 없는 경우
+}
+
 // ========================================
 // CORE DATA STRUCTURES
 // ========================================

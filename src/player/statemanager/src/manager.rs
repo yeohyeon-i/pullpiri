@@ -14,14 +14,15 @@
 //! (Scenario, Package, Model, Volume, Network, Node).
 
 use crate::state_machine::StateMachine;
-use crate::types::{ActionCommand, TransitionResult};
-use common::monitoringserver::ContainerList;
+use crate::types::{ActionCommand, ContainerState, TransitionResult};
+use common::monitoringserver::{ContainerInfo, ContainerList};
 
 use common::statemanager::{
     ErrorCode, ModelState, PackageState, ResourceType, ScenarioState, StateChange,
 };
 
 use common::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task;
@@ -434,59 +435,236 @@ impl StateManagerManager {
         println!("  Node Name: {}", container_list.node_name);
         println!("  Container Count: {}", container_list.containers.len());
 
-        // Process each container for health status analysis
-        for (i, container) in container_list.containers.iter().enumerate() {
-            // container.names is a Vec<String>, so join them for display
-            let container_names = container.names.join(", ");
-            println!("  Container {}: {}", i + 1, container_names);
-            println!("    Image: {}", container.image);
-            println!("    State: {:?}", container.state);
-            println!("    ID: {}", container.id);
+        // Group containers by model based on annotations
+        let models_containers = self
+            .group_containers_by_model(&container_list.containers)
+            .await;
 
-            // container.config is a HashMap, not an Option
-            if !container.config.is_empty() {
-                println!("    Config: {:?}", container.config);
+        for (model_name, containers) in models_containers {
+            println!("  Processing Model: {}", model_name);
+
+            // Determine new model state based on container states
+            let new_model_state = self.determine_model_state(&containers).await;
+            println!("    Determined state: {:?}", new_model_state);
+
+            // Save model state to etcd and handle result locally
+            match self
+                .save_model_state_to_etcd(&model_name, new_model_state)
+                .await
+            {
+                Ok(()) => {
+                    println!("    Successfully saved model state to etcd");
+
+                    // Trigger state transition if needed
+                    self.trigger_model_state_change(&model_name, new_model_state)
+                        .await;
+                }
+                Err(e) => {
+                    eprintln!("    Failed to save model state to etcd: {:?}", e);
+                }
             }
-
-            // Process container annotations if available
-            if !container.annotation.is_empty() {
-                println!("    Annotations: {:?}", container.annotation);
-            }
-
-            // TODO: Implement comprehensive container processing:
-            //
-            // 1. HEALTH STATUS ANALYSIS
-            //    - Analyze container state changes (running -> failed, etc.)
-            //    - Check exit codes for failure conditions
-            //    - Monitor resource usage and performance metrics
-            //    - Detect container restart loops and crash patterns
-            //
-            // 2. RESOURCE MAPPING
-            //    - Map containers to managed resources (scenarios, packages, models)
-            //    - Identify which resources are affected by container changes
-            //    - Determine impact on dependent resources
-            //
-            // 3. STATE TRANSITION TRIGGERS
-            //    - Trigger state transitions for failed containers
-            //    - Handle container recovery and restart scenarios
-            //    - Update resource states based on container health
-            //    - Escalate to recovery management for critical failures
-            //
-            // 4. HEALTH STATUS UPDATES
-            //    - Update resource health status based on container state
-            //    - Generate health check events and notifications
-            //    - Update monitoring and observability data
-            //    - Maintain health history for trend analysis
-            //
-            // 5. ASIL COMPLIANCE MONITORING
-            //    - Monitor ASIL-critical containers for safety violations
-            //    - Generate alerts for safety-critical container failures
-            //    - Implement timing constraints for container recovery
-            //    - Ensure safety systems remain operational
         }
 
-        println!("  Status: Container list processing completed (implementation pending)");
+        println!("  Status: Container list processing completed");
         println!("=====================================");
+    }
+
+    /// Groups containers by model name based on annotations
+    async fn group_containers_by_model<'a>(
+        &self,
+        containers: &'a [ContainerInfo],
+    ) -> HashMap<String, Vec<&'a ContainerInfo>> {
+        let mut models: HashMap<String, Vec<&ContainerInfo>> = HashMap::new();
+
+        for container in containers {
+            // Extract model name from container annotations
+            if let Some(model_name) = self.extract_model_name_from_container(container).await {
+                models.entry(model_name).or_default().push(container);
+            }
+        }
+
+        models
+    }
+
+    /// Extracts model name from container annotations
+    async fn extract_model_name_from_container(&self, container: &ContainerInfo) -> Option<String> {
+        // Look for model name in annotations with various possible keys
+        let possible_keys = [
+            "model.pullpiri.io/name",
+            "pullpiri.model.name",
+            "model-name",
+            "model_name",
+        ];
+
+        for key in &possible_keys {
+            if let Some(model_name) = container.annotation.get(*key) {
+                return Some(model_name.clone());
+            }
+        }
+
+        // Fallback: try to extract model name from container name or image
+        if !container.names.is_empty() {
+            // Use first container name and extract potential model name
+            let container_name = &container.names[0];
+            if let Some(model_name) = self.extract_model_name_from_string(container_name).await {
+                return Some(model_name);
+            }
+        }
+
+        // Fallback: try to extract from image name
+        if let Some(model_name) = self.extract_model_name_from_string(&container.image).await {
+            return Some(model_name);
+        }
+
+        None
+    }
+
+    /// Helper to extract model name from a string (container name or image)
+    async fn extract_model_name_from_string(&self, input: &str) -> Option<String> {
+        // Look for patterns like "model-<name>" or "<name>-model"
+        if input.contains("model") {
+            // Split by common delimiters and look for model-related parts
+            let parts: Vec<&str> = input.split(&['-', '_', '/', ':']).collect();
+
+            for (i, part) in parts.iter().enumerate() {
+                if part.to_lowercase() == "model" {
+                    // Check if there's a name before or after "model"
+                    if i > 0 && !parts[i - 1].is_empty() {
+                        return Some(parts[i - 1].to_string());
+                    }
+                    if i < parts.len() - 1 && !parts[i + 1].is_empty() {
+                        return Some(parts[i + 1].to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Determines model state based on container states according to the documentation
+    async fn determine_model_state(&self, containers: &[&ContainerInfo]) -> ModelState {
+        if containers.is_empty() {
+            return ModelState::Unspecified;
+        }
+
+        let mut container_states = Vec::new();
+
+        for container in containers {
+            let state = self.parse_container_state(container).await;
+            container_states.push(state);
+        }
+
+        // Apply state determination rules from documentation:
+        // - Created: model의 최초 상태
+        // - Paused: 모든 container가 paused 상태일 때
+        // - Exited: 모든 container가 exited 상태일 때
+        // - Dead: 하나 이상의 container가 dead 상태이거나, model 정보 조회 실패
+        // - Running: 위 조건을 모두 만족하지 않을 때(기본 상태)
+
+        // Check for Dead state first (highest priority)
+        if container_states
+            .iter()
+            .any(|&state| state == ContainerState::Dead)
+        {
+            return ModelState::Failed; // Dead maps to Failed in ModelState
+        }
+
+        // Check for all Paused
+        if container_states
+            .iter()
+            .all(|&state| state == ContainerState::Paused)
+        {
+            return ModelState::Unknown; // Paused maps to Unknown as closest equivalent
+        }
+
+        // Check for all Exited
+        if container_states
+            .iter()
+            .all(|&state| state == ContainerState::Exited)
+        {
+            return ModelState::Succeeded; // Exited maps to Succeeded
+        }
+
+        // Default to Running if none of the above conditions are met
+        ModelState::Running
+    }
+
+    /// Parses container state from container info
+    async fn parse_container_state(&self, container: &ContainerInfo) -> ContainerState {
+        // Check the state field in container info
+        // The state is stored as a map<string, string> in the proto
+
+        if let Some(status) = container.state.get("Status") {
+            match status.to_lowercase().as_str() {
+                "running" => ContainerState::Running,
+                "exited" => ContainerState::Exited,
+                "stopped" => ContainerState::Stopped,
+                "paused" => ContainerState::Paused,
+                "dead" => ContainerState::Dead,
+                "created" => ContainerState::Created,
+                _ => {
+                    // Try to determine from other state fields
+                    if let Some(health) = container.state.get("Health") {
+                        match health.to_lowercase().as_str() {
+                            "unhealthy" | "failed" => ContainerState::Dead,
+                            "healthy" => ContainerState::Running,
+                            _ => ContainerState::Unknown,
+                        }
+                    } else {
+                        ContainerState::Unknown
+                    }
+                }
+            }
+        } else {
+            // Fallback: try to parse from other state information
+            ContainerState::Unknown
+        }
+    }
+
+    /// Saves model state to etcd following the specified format
+    async fn save_model_state_to_etcd(
+        &self,
+        model_name: &str,
+        model_state: ModelState,
+    ) -> std::result::Result<(), String> {
+        let key = format!("/model/{}/state", model_name);
+        let value = model_state.as_str_name(); // Convert to string representation
+
+        println!("    Saving to etcd - Key: {}, Value: {}", key, value);
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            eprintln!("    Failed to save model state: {:?}", e);
+            return Err(format!("Failed to save model state: {:?}", e));
+        }
+
+        Ok(())
+    }
+
+    /// Triggers a state change through the state machine
+    async fn trigger_model_state_change(&self, model_name: &str, new_state: ModelState) {
+        let state_change = StateChange {
+            resource_type: ResourceType::Model as i32,
+            resource_name: model_name.to_string(),
+            current_state: "".to_string(), // Will be determined by state machine
+            target_state: new_state.as_str_name().to_string(),
+            transition_id: format!(
+                "model-{}-{}",
+                model_name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            source: "StateManager".to_string(),
+        };
+
+        println!("    Triggering state transition for model: {}", model_name);
+        self.process_state_change(state_change).await;
     }
 
     /// Main message processing loop for handling gRPC requests.
