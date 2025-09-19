@@ -15,13 +15,14 @@
 
 use crate::state_machine::StateMachine;
 use crate::types::{ActionCommand, TransitionResult};
-use common::monitoringserver::ContainerList;
+use common::monitoringserver::{ContainerInfo, ContainerList};
 
 use common::statemanager::{
     ErrorCode, ModelState, PackageState, ResourceType, ScenarioState, StateChange,
 };
 
 use common::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task;
@@ -61,6 +62,14 @@ pub struct StateManagerManager {
     /// - FilterGateway: Policy-driven state transitions and filtering decisions
     /// - ActionController: Action execution results and state confirmations
     rx_state_change: Arc<Mutex<mpsc::Receiver<StateChange>>>,
+
+    /// Model-Container mapping for tracking which containers belong to which models
+    /// Key: model_name, Value: Vec<container_id>
+    model_container_mapping: Arc<Mutex<HashMap<String, Vec<String>>>>,
+
+    /// Package-Model mapping for tracking which models belong to which packages
+    /// Key: package_name, Value: Vec<model_name>
+    package_model_mapping: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl StateManagerManager {
@@ -83,6 +92,8 @@ impl StateManagerManager {
             state_machine: Arc::new(Mutex::new(StateMachine::new())),
             rx_container: Arc::new(Mutex::new(rx_container)),
             rx_state_change: Arc::new(Mutex::new(rx_state_change)),
+            model_container_mapping: Arc::new(Mutex::new(HashMap::new())),
+            package_model_mapping: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -118,6 +129,9 @@ impl StateManagerManager {
 
         println!("State machine initialized with transition tables for Scenario, Package, and Model resources");
         println!("Async action executor started for non-blocking action processing");
+
+        // Initialize model-container and package-model mappings
+        self.initialize_mappings().await?;
 
         // TODO: Add comprehensive initialization logic:
         // - Load persisted resource states from persistent storage
@@ -434,6 +448,9 @@ impl StateManagerManager {
         println!("  Node Name: {}", container_list.node_name);
         println!("  Container Count: {}", container_list.containers.len());
 
+        // Get model-container mapping (unused for now, but available for future use)
+        let _model_container_mapping = self.model_container_mapping.lock().await;
+
         // Process each container for health status analysis
         for (i, container) in container_list.containers.iter().enumerate() {
             // container.names is a Vec<String>, so join them for display
@@ -451,41 +468,50 @@ impl StateManagerManager {
             // Process container annotations if available
             if !container.annotation.is_empty() {
                 println!("    Annotations: {:?}", container.annotation);
-            }
 
-            // TODO: Implement comprehensive container processing:
-            //
-            // 1. HEALTH STATUS ANALYSIS
-            //    - Analyze container state changes (running -> failed, etc.)
-            //    - Check exit codes for failure conditions
-            //    - Monitor resource usage and performance metrics
-            //    - Detect container restart loops and crash patterns
-            //
-            // 2. RESOURCE MAPPING
-            //    - Map containers to managed resources (scenarios, packages, models)
-            //    - Identify which resources are affected by container changes
-            //    - Determine impact on dependent resources
-            //
-            // 3. STATE TRANSITION TRIGGERS
-            //    - Trigger state transitions for failed containers
-            //    - Handle container recovery and restart scenarios
-            //    - Update resource states based on container health
-            //    - Escalate to recovery management for critical failures
-            //
-            // 4. HEALTH STATUS UPDATES
-            //    - Update resource health status based on container state
-            //    - Generate health check events and notifications
-            //    - Update monitoring and observability data
-            //    - Maintain health history for trend analysis
-            //
-            // 5. ASIL COMPLIANCE MONITORING
-            //    - Monitor ASIL-critical containers for safety violations
-            //    - Generate alerts for safety-critical container failures
-            //    - Implement timing constraints for container recovery
-            //    - Ensure safety systems remain operational
+                // Check if container is associated with a model
+                if let Some(model_name) = container.annotation.get("pullpiri.model") {
+                    println!("    Associated Model: {}", model_name);
+
+                    // Determine new model state based on container states
+                    if let Some(new_model_state) = self
+                        .determine_model_state_from_containers(
+                            model_name,
+                            &container_list.containers,
+                        )
+                        .await
+                    {
+                        println!("    Determined Model State: {:?}", new_model_state);
+
+                        // Save model state to ETCD and handle result
+                        let save_success = {
+                            let save_result = self
+                                .save_model_state_to_etcd(model_name, new_model_state)
+                                .await;
+
+                            match save_result {
+                                Ok(_) => {
+                                    println!("    Successfully saved model state to ETCD");
+                                    true
+                                }
+                                Err(e) => {
+                                    eprintln!("    Failed to save model state to ETCD: {:?}", e);
+                                    false
+                                }
+                            }
+                        };
+
+                        if save_success {
+                            // Trigger package cascade state change if needed
+                            self.trigger_package_cascade_state_change(model_name, new_model_state)
+                                .await;
+                        }
+                    }
+                }
+            }
         }
 
-        println!("  Status: Container list processing completed (implementation pending)");
+        println!("  Status: Container list processing completed");
         println!("=====================================");
     }
 
@@ -593,6 +619,8 @@ impl StateManagerManager {
             state_machine: Arc::clone(&self.state_machine),
             rx_container: Arc::clone(&self.rx_container),
             rx_state_change: Arc::clone(&self.rx_state_change),
+            model_container_mapping: Arc::clone(&self.model_container_mapping),
+            package_model_mapping: Arc::clone(&self.package_model_mapping),
         }
     }
 
@@ -822,6 +850,279 @@ async fn execute_action(command: ActionCommand) {
     );
 }
 
+impl StateManagerManager {
+    /// Determines the model state based on container states according to the documentation rules
+    ///
+    /// According to StateManager_Model.md section 4.2:
+    /// - Created: model의 최초 상태 (생성 시 기본 상태)
+    /// - Paused: 모든 container가 paused 상태일 때
+    /// - Exited: 모든 container가 exited 상태일 때  
+    /// - Dead: 하나 이상의 container가 dead 상태이거나, model 정보 조회 실패
+    /// - Running: 위 조건을 모두 만족하지 않을 때(기본 상태)
+    async fn determine_model_state_from_containers(
+        &self,
+        model_name: &str,
+        all_containers: &[ContainerInfo],
+    ) -> Option<ModelState> {
+        // Get containers that belong to this model
+        let model_containers: Vec<&ContainerInfo> = all_containers
+            .iter()
+            .filter(|container| {
+                container
+                    .annotation
+                    .get("pullpiri.model")
+                    .map_or(false, |name| name == model_name)
+            })
+            .collect();
+
+        if model_containers.is_empty() {
+            println!("    No containers found for model: {}", model_name);
+            return Some(ModelState::Pending); // No containers yet, model is pending
+        }
+
+        println!(
+            "    Found {} containers for model: {}",
+            model_containers.len(),
+            model_name
+        );
+
+        // Count container states
+        let mut running_count = 0;
+        let mut exited_count = 0;
+        let mut paused_count = 0;
+        let mut dead_count = 0;
+        let mut other_count = 0;
+
+        for container in &model_containers {
+            // Check container status from state field
+            if let Some(status) = container.state.get("Status") {
+                match status.to_lowercase().as_str() {
+                    "running" => running_count += 1,
+                    "exited" => exited_count += 1,
+                    "paused" => paused_count += 1,
+                    "dead" | "removing" | "unknown" => dead_count += 1,
+                    _ => other_count += 1,
+                }
+            } else {
+                // If no status found, consider as dead (information retrieval failure)
+                dead_count += 1;
+            }
+        }
+
+        let total_containers = model_containers.len();
+
+        println!(
+            "    Container states - Running: {}, Exited: {}, Paused: {}, Dead: {}, Other: {}",
+            running_count, exited_count, paused_count, dead_count, other_count
+        );
+
+        // Apply state determination rules from documentation
+        if dead_count > 0 {
+            Some(ModelState::Failed) // Using Failed instead of Dead as it's available in the enum
+        } else if exited_count == total_containers {
+            Some(ModelState::Succeeded) // All containers exited successfully
+        } else if paused_count == total_containers {
+            Some(ModelState::Unknown) // Using Unknown for paused state as Paused is not in enum
+        } else if running_count > 0 {
+            Some(ModelState::Running) // At least one container is running
+        } else {
+            Some(ModelState::Pending) // Default state
+        }
+    }
+
+    /// Saves model state to ETCD following the documentation format
+    ///
+    /// According to StateManager_Model.md section 5:
+    /// let key = format!("/model/{}/state", model_name);
+    /// let value = model_state.as_str_name();
+    async fn save_model_state_to_etcd(
+        &self,
+        model_name: &str,
+        state: ModelState,
+    ) -> common::Result<()> {
+        let key = format!("/model/{}/state", model_name);
+        let value = state.as_str_name();
+
+        println!("    Saving to ETCD: key='{}', value='{}'", key, value);
+
+        match common::etcd::put(&key, value).await {
+            Ok(_) => {
+                println!("    Successfully saved model state to ETCD");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("    Failed to save model state to ETCD: {:?}", e);
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("ETCD put failed: {:?}", e),
+                )))
+            }
+        }
+    }
+
+    /// Triggers package state changes based on model state changes
+    ///
+    /// According to StateManager_Package.md section 2:
+    /// - 조건: `<model, state>` 리스트가 package의 특정 state 조건과 일치하면 package의 state를 변경
+    /// - 발신: ETCD에 `<package, state>` put 요청
+    async fn trigger_package_cascade_state_change(
+        &self,
+        model_name: &str,
+        _model_state: ModelState,
+    ) {
+        let package_model_mapping = self.package_model_mapping.lock().await;
+
+        // Find which package this model belongs to
+        for (package_name, models) in package_model_mapping.iter() {
+            if models.contains(&model_name.to_string()) {
+                println!(
+                    "    Model '{}' belongs to package '{}', checking cascade state change",
+                    model_name, package_name
+                );
+
+                // Get all model states for this package
+                if let Some(package_state) = self
+                    .determine_package_state_from_models(package_name, models)
+                    .await
+                {
+                    println!(
+                        "    Determined package state: {:?} for package: {}",
+                        package_state, package_name
+                    );
+
+                    // Save package state to ETCD
+                    let save_result = self
+                        .save_package_state_to_etcd(package_name, package_state)
+                        .await;
+                    match save_result {
+                        Ok(_) => {
+                            println!("    Successfully saved package state to ETCD");
+                        }
+                        Err(e) => {
+                            eprintln!("    Failed to save package state to ETCD: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Determines package state based on model states according to documentation rules
+    ///
+    /// According to StateManager_Model.md section 4.1:
+    /// - idle: 맨 처음 package의 상태 (생성 시 기본 상태)
+    /// - paused: 모든 model이 paused 상태일 때
+    /// - exited: 모든 model이 exited 상태일 때
+    /// - degraded: 일부 model이 dead 상태일 때
+    /// - error: 모든 model이 dead 상태일 때
+    /// - running: 위 조건을 모두 만족하지 않을 때(기본 상태)
+    async fn determine_package_state_from_models(
+        &self,
+        package_name: &str,
+        model_names: &[String],
+    ) -> Option<PackageState> {
+        if model_names.is_empty() {
+            return Some(PackageState::Initializing); // No models, package is initializing
+        }
+
+        // Get current states of all models from ETCD
+        let mut running_count = 0;
+        let mut succeeded_count = 0; // Mapping exited to succeeded
+        let mut failed_count = 0; // Mapping dead to failed
+        let mut unknown_count = 0; // Mapping paused to unknown
+        let mut pending_count = 0;
+
+        for model_name in model_names {
+            let key = format!("/model/{}/state", model_name);
+            match common::etcd::get(&key).await {
+                Ok(state_str) => {
+                    if let Some(model_state) = ModelState::from_str_name(&state_str) {
+                        match model_state {
+                            ModelState::Running => running_count += 1,
+                            ModelState::Succeeded => succeeded_count += 1,
+                            ModelState::Failed => failed_count += 1,
+                            ModelState::Unknown => unknown_count += 1,
+                            _ => pending_count += 1,
+                        }
+                    }
+                }
+                Err(_) => {
+                    // If we can't get state, consider as pending
+                    pending_count += 1;
+                }
+            }
+        }
+
+        let total_models = model_names.len();
+
+        println!(
+            "    Package '{}' model states - Running: {}, Succeeded: {}, Failed: {}, Unknown: {}, Pending: {}",
+            package_name, running_count, succeeded_count, failed_count, unknown_count, pending_count
+        );
+
+        // Apply package state determination rules
+        if failed_count == total_models {
+            Some(PackageState::Error) // All models failed
+        } else if failed_count > 0 {
+            Some(PackageState::Degraded) // Some models failed
+        } else if succeeded_count == total_models {
+            Some(PackageState::Running) // All models succeeded - treat as running
+        } else if unknown_count == total_models {
+            Some(PackageState::Paused) // All models paused
+        } else if running_count > 0 {
+            Some(PackageState::Running) // At least one model running
+        } else {
+            Some(PackageState::Initializing) // Default state
+        }
+    }
+
+    /// Saves package state to ETCD
+    async fn save_package_state_to_etcd(
+        &self,
+        package_name: &str,
+        state: PackageState,
+    ) -> common::Result<()> {
+        let key = format!("/package/{}/state", package_name);
+        let value = state.as_str_name();
+
+        println!("    Saving to ETCD: key='{}', value='{}'", key, value);
+
+        match common::etcd::put(&key, value).await {
+            Ok(_) => {
+                println!("    Successfully saved package state to ETCD");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("    Failed to save package state to ETCD: {:?}", e);
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("ETCD put failed: {:?}", e),
+                )))
+            }
+        }
+    }
+
+    /// Initialize model-container and package-model mappings
+    /// This would typically load from configuration or discovery
+    pub async fn initialize_mappings(&mut self) -> common::Result<()> {
+        println!("Initializing model-container and package-model mappings");
+
+        // TODO: Load mappings from configuration files or discovery mechanisms
+        // For now, we'll initialize with empty mappings that will be populated
+        // as containers are discovered with annotations
+
+        // Example of how mappings would be populated:
+        // let mut model_container_mapping = self.model_container_mapping.lock().await;
+        // model_container_mapping.insert("example_model".to_string(), vec!["container1".to_string(), "container2".to_string()]);
+
+        // let mut package_model_mapping = self.package_model_mapping.lock().await;
+        // package_model_mapping.insert("example_package".to_string(), vec!["model1".to_string(), "model2".to_string()]);
+
+        println!("Model-container and package-model mappings initialized");
+        Ok(())
+    }
+}
+
 // ========================================
 // FUTURE IMPLEMENTATION AREAS
 // ========================================
@@ -874,3 +1175,145 @@ async fn execute_action(command: ActionCommand) {
 //    - Resource usage monitoring and optimization
 //    - Health check automation and reporting
 //    - Metrics collection and observability integration
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_determine_model_state_all_running() {
+        let (_tx_container, rx_container) = mpsc::channel(10);
+        let (_tx_state_change, rx_state_change) = mpsc::channel(10);
+
+        let manager = StateManagerManager::new(rx_container, rx_state_change).await;
+
+        // Create containers with running state and proper annotation
+        let mut container1 = ContainerInfo {
+            id: "container1".to_string(),
+            names: vec!["test-container-1".to_string()],
+            image: "test-image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        container1.state.insert("Status".to_string(), "running".to_string());
+        container1.annotation.insert("pullpiri.model".to_string(), "test_model".to_string());
+
+        let containers = vec![container1];
+        let result = manager.determine_model_state_from_containers("test_model", &containers).await;
+
+        assert_eq!(result, Some(ModelState::Running));
+    }
+
+    #[tokio::test]
+    async fn test_determine_model_state_all_exited() {
+        let (_tx_container, rx_container) = mpsc::channel(10);
+        let (_tx_state_change, rx_state_change) = mpsc::channel(10);
+
+        let manager = StateManagerManager::new(rx_container, rx_state_change).await;
+
+        // Create containers with exited state and proper annotation
+        let mut container1 = ContainerInfo {
+            id: "container1".to_string(),
+            names: vec!["test-container-1".to_string()],
+            image: "test-image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        container1.state.insert("Status".to_string(), "exited".to_string());
+        container1.annotation.insert("pullpiri.model".to_string(), "test_model".to_string());
+
+        let containers = vec![container1];
+        let result = manager.determine_model_state_from_containers("test_model", &containers).await;
+
+        assert_eq!(result, Some(ModelState::Succeeded));
+    }
+
+    #[tokio::test]
+    async fn test_determine_model_state_some_dead() {
+        let (_tx_container, rx_container) = mpsc::channel(10);
+        let (_tx_state_change, rx_state_change) = mpsc::channel(10);
+
+        let manager = StateManagerManager::new(rx_container, rx_state_change).await;
+
+        // Create containers with one running and one dead, both with proper annotations
+        let mut container1 = ContainerInfo {
+            id: "container1".to_string(),
+            names: vec!["test-container-1".to_string()],
+            image: "test-image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        container1.state.insert("Status".to_string(), "running".to_string());
+        container1.annotation.insert("pullpiri.model".to_string(), "test_model".to_string());
+
+        let mut container2 = ContainerInfo {
+            id: "container2".to_string(),
+            names: vec!["test-container-2".to_string()],
+            image: "test-image".to_string(),
+            state: HashMap::new(),
+            config: HashMap::new(),
+            annotation: HashMap::new(),
+            stats: HashMap::new(),
+        };
+        container2.state.insert("Status".to_string(), "dead".to_string());
+        container2.annotation.insert("pullpiri.model".to_string(), "test_model".to_string());
+
+        let containers = vec![container1, container2];
+        let result = manager.determine_model_state_from_containers("test_model", &containers).await;
+
+        assert_eq!(result, Some(ModelState::Failed));
+    }
+
+    #[tokio::test]
+    async fn test_determine_model_state_no_containers() {
+        let (_tx_container, rx_container) = mpsc::channel(10);
+        let (_tx_state_change, rx_state_change) = mpsc::channel(10);
+
+        let manager = StateManagerManager::new(rx_container, rx_state_change).await;
+
+        let containers = vec![];
+        let result = manager.determine_model_state_from_containers("test_model", &containers).await;
+
+        assert_eq!(result, Some(ModelState::Pending));
+    }
+
+    #[test]
+    fn test_etcd_key_formats() {
+        // Test model key format
+        let model_name = "test_model";
+        let model_key = format!("/model/{}/state", model_name);
+        assert_eq!(model_key, "/model/test_model/state");
+
+        // Test package key format
+        let package_name = "test_package";
+        let package_key = format!("/package/{}/state", package_name);
+        assert_eq!(package_key, "/package/test_package/state");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mappings() {
+        let (_tx_container, rx_container) = mpsc::channel(10);
+        let (_tx_state_change, rx_state_change) = mpsc::channel(10);
+
+        let mut manager = StateManagerManager::new(rx_container, rx_state_change).await;
+
+        // Test that initialization doesn't fail
+        let result = manager.initialize_mappings().await;
+        assert!(result.is_ok());
+
+        // Verify empty mappings are initialized
+        let model_mapping = manager.model_container_mapping.lock().await;
+        assert!(model_mapping.is_empty());
+
+        let package_mapping = manager.package_model_mapping.lock().await;
+        assert!(package_mapping.is_empty());
+    }
+}
