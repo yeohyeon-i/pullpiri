@@ -52,15 +52,7 @@ model의 state는 model에 포함된 container의 상태가 model의 의 특정 
 
 - **인터페이스:** 외부 인터페이스(gRPC)로부터 수신, 외부 인터페이스(ETCD)로 발신
  
-## 4. 구현 규칙
-
-이 문서를 기반으로 구현할 경우 반드시 따라야 하는 구현 규칙은 다음과 같다. 
-
-### 4.1 state의 변경은 state_machine.rs 파일의 StateMachine 구현 블록 내에 구현된 함수를 호출하여 처리해야 함.
-
-state의 변경은 state_machine.rs 파일 내 StateManchine 구현 블록 내에 구현된 함수를 호출하여 처리해야 한다. 
-
-### 4.2 etcd로 put, get 하는 방법 규칙 
+## 4. etcd로 put, get 하는 방법 규칙 
 etcd에 값을 저장(put)하거나 조회(get)할 때는 문서에 제시된 예시 코드의 지정된 key/value 포맷대로 작성해야 한다. 
 
 예시1 : model의 state put 시 
