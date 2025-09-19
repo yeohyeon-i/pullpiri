@@ -56,13 +56,9 @@ model의 state는 model에 포함된 container의 상태가 model의 의 특정 
 
 이 문서를 기반으로 구현할 경우 반드시 따라야 하는 구현 규칙은 다음과 같다. 
 
-### 4.1 state 변경 기능의 구현 위치 규칙
+### 4.1 state의 변경은 state_machine.rs 파일의 StateMachine 구현 블록 내에 구현된 함수를 호출하여 처리해야 함.
 
-아래 로직은 state_machine.rs 파일 내 StateMachine 구현 블록 내에 구현되어야 한다. 
-
-**조건:** `<container, state>` 리스트가 model의 특정 state 조건과 일치하면 model의 state를 변경
-**구현위치:** pub struct StateMachine 구조체의 impl StateMachine 구현 블록에 구현되어야 함
-
+state의 변경은 state_machine.rs 파일 내 StateManchine 구현 블록 내에 구현된 함수를 호출하여 처리해야 한다. 
 
 ### 4.2 etcd로 put, get 하는 방법 규칙 
 etcd에 값을 저장(put)하거나 조회(get)할 때는 문서에 제시된 예시 코드의 지정된 key/value 포맷대로 작성해야 한다. 
