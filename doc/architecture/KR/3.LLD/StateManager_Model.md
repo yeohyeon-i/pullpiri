@@ -10,14 +10,21 @@
 
 ## 2. StateManager의 구현 구조
 main.rs: StateManager 실행의 진입점(메인 함수)입니다. 서비스 초기화, 설정 로딩, 서버 실행 등을 담당합니다.
+
 manager.rs: StateManager의 핵심 로직(상태 변경 처리, 상위/하위 리소스 상태 연쇄 관리 등)을 구현합니다.
+
 state_machine.rs: 리소스(Scenario, Package, Model 등)의 상태 전이 규칙과 상태 관리 핵심 알고리즘을 담당하는 상태머신 구현 파일입니다.
+
 types.rs: StateManager에서 사용하는 데이터 구조체, enum, 타입 정의가 모여 있습니다.
+
 mod.rs: src 디렉터리의 모듈 트리 구성을 위한 모듈 선언 파일입니다.
+
 grpc/
-mod.rs: grpc 하위 모듈 트리 구성을 위한 모듈 선언 파일입니다.
-receiver.rs: gRPC를 통해 외부에서 들어오는 상태 변경 요청을 수신하고 처리하는 역할을 합니다.
-sender.rs: gRPC를 통해 외부 시스템에 상태 변경 결과나 알림을 전송하는 역할을 합니다.
+	mod.rs: grpc 하위 모듈 트리 구성을 위한 모듈 선언 파일입니다.
+	
+    receiver.rs: gRPC를 통해 외부에서 들어오는 상태 변경 요청을 수신하고 처리하는 역할을 합니다.
+	
+    sender.rs: gRPC를 통해 외부 시스템에 상태 변경 결과나 알림을 전송하는 역할을 합니다.
 
 ## 3. model을 위해 StateManager에 구현되어야 하는 것 
 ```
