@@ -1,4 +1,4 @@
-use common::statemanager::{ErrorCode, ResourceType};
+use common::statemanager::{ErrorCode, ModelState, PackageState, ResourceType};
 use std::collections::HashMap;
 use tokio::time::Instant;
 // ========================================
@@ -56,4 +56,34 @@ pub struct TransitionResult {
     pub actions_to_execute: Vec<String>,
     pub transition_id: String,
     pub error_details: String,
+}
+
+/// Container state information from NodeAgent
+#[derive(Debug, Clone)]
+pub struct ContainerStateInfo {
+    pub container_id: String,
+    pub container_names: Vec<String>,
+    pub image: String,
+    pub state: HashMap<String, String>,
+    pub config: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
+}
+
+/// Model information with associated containers
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub model_name: String,
+    pub package_name: String,
+    pub containers: Vec<ContainerStateInfo>,
+    pub current_state: ModelState,
+    pub last_update: Instant,
+}
+
+/// Package information with associated models
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    pub package_name: String,
+    pub models: HashMap<String, ModelInfo>,
+    pub current_state: PackageState,
+    pub last_update: Instant,
 }
