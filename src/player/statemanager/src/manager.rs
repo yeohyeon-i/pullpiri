@@ -15,13 +15,14 @@
 
 use crate::state_machine::StateMachine;
 use crate::types::{ActionCommand, TransitionResult};
-use common::monitoringserver::ContainerList;
+use common::monitoringserver::{ContainerInfo, ContainerList};
 
 use common::statemanager::{
     ErrorCode, ModelState, PackageState, ResourceType, ScenarioState, StateChange,
 };
 
 use common::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task;
@@ -416,77 +417,412 @@ impl StateManagerManager {
         // - Update monitoring metrics
     }
 
-    /// Processes a ContainerList message for container health monitoring.
+    /// Processes a ContainerList message for container health monitoring and model state updates.
     ///
     /// This method handles container status updates from nodeagent and
-    /// triggers appropriate state transitions based on container health.
+    /// triggers appropriate state transitions for models and packages based on container health.
     ///
     /// # Arguments
     /// * `container_list` - ContainerList message with node and container status
     ///
     /// # Processing Steps
     /// 1. Analyze container health and status changes
-    /// 2. Identify resources affected by container changes
-    /// 3. Trigger state transitions for failed or recovered containers
-    /// 4. Update resource health status and monitoring data
+    /// 2. Group containers by model based on annotations
+    /// 3. Evaluate model states based on container states
+    /// 4. Update model states in ETCD and trigger package state cascading
     async fn process_container_list(&self, container_list: ContainerList) {
         println!("=== PROCESSING CONTAINER LIST ===");
         println!("  Node Name: {}", container_list.node_name);
         println!("  Container Count: {}", container_list.containers.len());
 
-        // Process each container for health status analysis
-        for (i, container) in container_list.containers.iter().enumerate() {
-            // container.names is a Vec<String>, so join them for display
+        // Group containers by model name
+        let mut model_containers: HashMap<String, Vec<&ContainerInfo>> = HashMap::new();
+
+        for container in &container_list.containers {
             let container_names = container.names.join(", ");
-            println!("  Container {}: {}", i + 1, container_names);
+            println!("  Container: {}", container_names);
             println!("    Image: {}", container.image);
             println!("    State: {:?}", container.state);
             println!("    ID: {}", container.id);
 
-            // container.config is a HashMap, not an Option
-            if !container.config.is_empty() {
-                println!("    Config: {:?}", container.config);
+            // Extract model name from container annotations
+            if let Some(model_name) = self.extract_model_name_from_container(container) {
+                println!("    Associated Model: {}", model_name);
+                model_containers
+                    .entry(model_name)
+                    .or_default()
+                    .push(container);
+            } else {
+                println!("    No model association found");
             }
-
-            // Process container annotations if available
-            if !container.annotation.is_empty() {
-                println!("    Annotations: {:?}", container.annotation);
-            }
-
-            // TODO: Implement comprehensive container processing:
-            //
-            // 1. HEALTH STATUS ANALYSIS
-            //    - Analyze container state changes (running -> failed, etc.)
-            //    - Check exit codes for failure conditions
-            //    - Monitor resource usage and performance metrics
-            //    - Detect container restart loops and crash patterns
-            //
-            // 2. RESOURCE MAPPING
-            //    - Map containers to managed resources (scenarios, packages, models)
-            //    - Identify which resources are affected by container changes
-            //    - Determine impact on dependent resources
-            //
-            // 3. STATE TRANSITION TRIGGERS
-            //    - Trigger state transitions for failed containers
-            //    - Handle container recovery and restart scenarios
-            //    - Update resource states based on container health
-            //    - Escalate to recovery management for critical failures
-            //
-            // 4. HEALTH STATUS UPDATES
-            //    - Update resource health status based on container state
-            //    - Generate health check events and notifications
-            //    - Update monitoring and observability data
-            //    - Maintain health history for trend analysis
-            //
-            // 5. ASIL COMPLIANCE MONITORING
-            //    - Monitor ASIL-critical containers for safety violations
-            //    - Generate alerts for safety-critical container failures
-            //    - Implement timing constraints for container recovery
-            //    - Ensure safety systems remain operational
         }
 
-        println!("  Status: Container list processing completed (implementation pending)");
+        // Process each model based on its containers
+        for (model_name, containers) in model_containers {
+            println!(
+                "  Processing model '{}' with {} containers",
+                model_name,
+                containers.len()
+            );
+
+            // Evaluate model state based on container states
+            let model_state = self.evaluate_model_state_from_containers(&containers);
+            println!("    Evaluated model state: {:?}", model_state);
+
+            // Save model state to ETCD
+            if let Err(e) = self
+                .save_model_state_to_etcd(&model_name, model_state)
+                .await
+            {
+                eprintln!("    Failed to save model state to ETCD: {:?}", e);
+            } else {
+                println!(
+                    "    Successfully saved model '{}' state to ETCD",
+                    model_name
+                );
+            }
+
+            // Check if this model state change affects package states
+            if let Err(e) = self
+                .check_and_update_package_states(&model_name, model_state)
+                .await
+            {
+                eprintln!("    Failed to update package states: {:?}", e);
+            }
+        }
+
+        println!("  Status: Container list processing completed");
         println!("=====================================");
+    }
+
+    /// Extracts model name from container annotations.
+    ///
+    /// # Arguments
+    /// * `container` - Container information
+    ///
+    /// # Returns
+    /// * `Option<String>` - Model name if found in annotations
+    fn extract_model_name_from_container(&self, container: &ContainerInfo) -> Option<String> {
+        // Look for model name in container annotations
+        // Common annotation keys for model association:
+        // - "model.pullpiri.io/name"
+        // - "pullpiri.io/model"
+        // - "model"
+
+        container
+            .annotation
+            .get("model.pullpiri.io/name")
+            .or_else(|| container.annotation.get("pullpiri.io/model"))
+            .or_else(|| container.annotation.get("model"))
+            .cloned()
+    }
+
+    /// Evaluates model state based on container states according to the documentation.
+    ///
+    /// Model state evaluation rules from documentation mapped to proto enum:
+    /// - Created (doc) -> PENDING (proto): All containers are in created state
+    /// - Paused (doc) -> no direct mapping, using UNKNOWN for now
+    /// - Exited (doc) -> SUCCEEDED (proto): All containers are in exited state  
+    /// - Dead (doc) -> FAILED (proto): One or more containers are in dead state, or model info retrieval failed
+    /// - Running (doc) -> RUNNING (proto): Default state when above conditions are not met
+    ///
+    /// # Arguments
+    /// * `containers` - List of containers for this model
+    ///
+    /// # Returns
+    /// * `ModelState` - Evaluated model state
+    fn evaluate_model_state_from_containers(&self, containers: &[&ContainerInfo]) -> ModelState {
+        if containers.is_empty() {
+            return ModelState::Failed; // No containers means model is failed (dead)
+        }
+
+        let mut paused_count = 0;
+        let mut exited_count = 0;
+        let mut created_count = 0;
+        let mut dead_count = 0;
+
+        for container in containers {
+            // Get container state from the state map
+            let container_state = container
+                .state
+                .get("status")
+                .or_else(|| container.state.get("State"))
+                .unwrap_or(&String::from("unknown"))
+                .to_lowercase();
+
+            match container_state.as_str() {
+                "created" => created_count += 1,
+                "paused" => paused_count += 1,
+                "exited" => exited_count += 1,
+                "dead" | "died" | "failed" => dead_count += 1,
+                _ => {} // running, restarting, etc. don't increment counters
+            }
+        }
+
+        let total_containers = containers.len();
+
+        // Apply state evaluation rules from documentation mapped to proto enum
+        if dead_count > 0 {
+            ModelState::Failed // One or more containers are dead -> FAILED
+        } else if exited_count == total_containers {
+            ModelState::Succeeded // All containers are exited -> SUCCEEDED
+        } else if created_count == total_containers {
+            ModelState::Pending // All containers are created -> PENDING
+        } else if paused_count == total_containers {
+            ModelState::Unknown // All containers are paused -> UNKNOWN (no direct mapping)
+        } else {
+            ModelState::Running // Default state -> RUNNING
+        }
+    }
+
+    /// Saves model state to ETCD using the documented key/value format.
+    ///
+    /// # Arguments
+    /// * `model_name` - Name of the model
+    /// * `model_state` - State to save
+    ///
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    async fn save_model_state_to_etcd(
+        &self,
+        model_name: &str,
+        model_state: ModelState,
+    ) -> Result<()> {
+        let key = format!("/model/{}/state", model_name);
+        let value = model_state.as_str_name(); // Convert enum to string
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            eprintln!("Failed to save model state to ETCD: {:?}", e);
+            return Err(e.into());
+        }
+
+        println!("Saved model '{}' state '{}' to ETCD", model_name, value);
+        Ok(())
+    }
+
+    /// Checks if model state change affects package states and updates them accordingly.
+    ///
+    /// # Arguments  
+    /// * `model_name` - Name of the model that changed state
+    /// * `model_state` - New state of the model
+    ///
+    /// # Returns
+    /// * `Result<()>` - Success or error  
+    async fn check_and_update_package_states(
+        &self,
+        model_name: &str,
+        _model_state: ModelState,
+    ) -> Result<()> {
+        // Find packages that contain this model
+        // This requires getting all models with prefix and finding their parent packages
+        let prefix = "/model/";
+
+        match common::etcd::get_all_with_prefix(prefix).await {
+            Ok(model_kvs) => {
+                // Group models by package (need to determine package from model name or separate mapping)
+                let mut packages_to_check: HashMap<String, Vec<String>> = HashMap::new();
+
+                for kv in model_kvs {
+                    if let Some(model_name_from_key) = kv
+                        .key
+                        .strip_prefix("/model/")
+                        .and_then(|s| s.strip_suffix("/state"))
+                    {
+                        // For now, assume package name is derived from model name
+                        // In a real implementation, this would be more sophisticated
+                        let package_name =
+                            self.extract_package_name_from_model(model_name_from_key);
+                        packages_to_check
+                            .entry(package_name)
+                            .or_default()
+                            .push(model_name_from_key.to_string());
+                    }
+                }
+
+                // Update each affected package
+                for (package_name, model_names) in packages_to_check {
+                    if model_names.contains(&model_name.to_string()) {
+                        if let Err(e) = self
+                            .update_package_state_from_models(&package_name, &model_names)
+                            .await
+                        {
+                            eprintln!("Failed to update package '{}' state: {:?}", package_name, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to query models from ETCD: {:?}", e);
+                return Err(e.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extracts package name from model name.
+    /// This is a simplified implementation - in practice this would be more sophisticated.
+    ///
+    /// # Arguments
+    /// * `model_name` - Name of the model
+    ///
+    /// # Returns
+    /// * `String` - Package name
+    fn extract_package_name_from_model(&self, model_name: &str) -> String {
+        // Simple heuristic: assume package name is the prefix before the last '-' or '_'
+        // Or use the first part of the model name
+        if let Some(pos) = model_name.rfind(['-', '_']) {
+            model_name[..pos].to_string()
+        } else {
+            // If no separator, use the whole name as package name
+            model_name.to_string()
+        }
+    }
+
+    /// Updates package state based on its models' states according to documentation rules.
+    ///
+    /// Package state rules:
+    /// - idle: Initial state when package is created  
+    /// - paused: All models are paused
+    /// - exited: All models are exited
+    /// - degraded: Some (but not all) models are dead
+    /// - error: All models are dead
+    /// - running: Default state when above conditions are not met
+    ///
+    /// # Arguments
+    /// * `package_name` - Name of the package to update
+    /// * `model_names` - List of model names in this package
+    ///
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    async fn update_package_state_from_models(
+        &self,
+        package_name: &str,
+        model_names: &[String],
+    ) -> Result<()> {
+        if model_names.is_empty() {
+            return Ok(());
+        }
+
+        // Get states of all models in this package
+        let mut model_states: Vec<ModelState> = Vec::new();
+
+        for model_name in model_names {
+            let key = format!("/model/{}/state", model_name);
+            match common::etcd::get(&key).await {
+                Ok(state_str) => {
+                    // Parse state string back to enum (match proto enum values)
+                    let model_state = match state_str.as_str() {
+                        "PENDING" | "Pending" => ModelState::Pending,
+                        "RUNNING" | "Running" => ModelState::Running,
+                        "SUCCEEDED" | "Succeeded" => ModelState::Succeeded,
+                        "FAILED" | "Failed" => ModelState::Failed,
+                        "UNKNOWN" | "Unknown" => ModelState::Unknown,
+                        "CONTAINER_CREATING" | "ContainerCreating" => ModelState::ContainerCreating,
+                        "CRASH_LOOP_BACK_OFF" | "CrashLoopBackOff" => ModelState::CrashLoopBackOff,
+                        _ => ModelState::Unknown,
+                    };
+                    model_states.push(model_state);
+                }
+                Err(_) => {
+                    // If we can't get model state, assume it's failed
+                    model_states.push(ModelState::Failed);
+                }
+            }
+        }
+
+        // Evaluate package state based on model states
+        let package_state = self.evaluate_package_state_from_models(&model_states);
+
+        // Save package state to ETCD
+        let key = format!("/package/{}/state", package_name);
+        let value = package_state.as_str_name();
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            eprintln!("Failed to save package state to ETCD: {:?}", e);
+            return Err(e.into());
+        }
+
+        println!(
+            "Updated package '{}' state to '{}' based on model states",
+            package_name, value
+        );
+
+        // If package is in dead state, trigger reconcile action to ActionController
+        if matches!(package_state, PackageState::Error) {
+            if let Err(e) = self.trigger_package_reconcile(package_name).await {
+                eprintln!("Failed to trigger package reconcile: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Evaluates package state based on its models' states according to documentation rules.
+    ///
+    /// Package state evaluation rules from documentation:
+    /// - idle: Initial state (maps to INITIALIZING)
+    /// - paused: All models are paused (maps to PAUSED)
+    /// - exited: All models are exited (no direct mapping, use RUNNING for now)
+    /// - degraded: Some models are dead (maps to DEGRADED)  
+    /// - error: All models are dead (maps to ERROR)
+    /// - running: Default state (maps to RUNNING)
+    ///
+    /// # Arguments
+    /// * `model_states` - List of model states
+    ///
+    /// # Returns
+    /// * `PackageState` - Evaluated package state
+    fn evaluate_package_state_from_models(&self, model_states: &[ModelState]) -> PackageState {
+        if model_states.is_empty() {
+            return PackageState::Error; // No models means error state
+        }
+
+        let total_models = model_states.len();
+        let failed_count = model_states
+            .iter()
+            .filter(|&s| matches!(s, ModelState::Failed))
+            .count();
+        let unknown_count = model_states
+            .iter()
+            .filter(|&s| matches!(s, ModelState::Unknown))
+            .count(); // For paused equivalent
+        let _succeeded_count = model_states
+            .iter()
+            .filter(|&s| matches!(s, ModelState::Succeeded))
+            .count();
+
+        // Apply package state evaluation rules from documentation
+        if failed_count == total_models {
+            PackageState::Error // All models are failed (dead) -> error
+        } else if failed_count > 0 {
+            PackageState::Degraded // Some (but not all) models are failed -> degraded
+        } else if unknown_count == total_models {
+            PackageState::Paused // All models are unknown (paused equivalent) -> paused
+        } else {
+            PackageState::Running // Default state (includes succeeded models) -> running
+        }
+    }
+
+    /// Triggers reconcile action to ActionController when package is in dead state.
+    ///
+    /// # Arguments
+    /// * `package_name` - Name of the package to reconcile
+    ///
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    async fn trigger_package_reconcile(&self, package_name: &str) -> Result<()> {
+        println!("Triggering reconcile for package '{}'", package_name);
+
+        // TODO: Implement gRPC call to ActionController for reconcile
+        // This would use the sender.rs functionality to send reconcile request
+        // For now, just log the action
+        println!(
+            "  Would send reconcile request to ActionController for package '{}'",
+            package_name
+        );
+
+        Ok(())
     }
 
     /// Main message processing loop for handling gRPC requests.
