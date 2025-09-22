@@ -434,59 +434,278 @@ impl StateManagerManager {
         println!("  Node Name: {}", container_list.node_name);
         println!("  Container Count: {}", container_list.containers.len());
 
+        // Group containers by model using annotations
+        let mut model_containers: std::collections::HashMap<
+            String,
+            Vec<&common::monitoringserver::ContainerInfo>,
+        > = std::collections::HashMap::new();
+
         // Process each container for health status analysis
         for (i, container) in container_list.containers.iter().enumerate() {
-            // container.names is a Vec<String>, so join them for display
             let container_names = container.names.join(", ");
             println!("  Container {}: {}", i + 1, container_names);
             println!("    Image: {}", container.image);
             println!("    State: {:?}", container.state);
             println!("    ID: {}", container.id);
 
-            // container.config is a HashMap, not an Option
             if !container.config.is_empty() {
                 println!("    Config: {:?}", container.config);
             }
 
-            // Process container annotations if available
             if !container.annotation.is_empty() {
                 println!("    Annotations: {:?}", container.annotation);
-            }
 
-            // TODO: Implement comprehensive container processing:
-            //
-            // 1. HEALTH STATUS ANALYSIS
-            //    - Analyze container state changes (running -> failed, etc.)
-            //    - Check exit codes for failure conditions
-            //    - Monitor resource usage and performance metrics
-            //    - Detect container restart loops and crash patterns
-            //
-            // 2. RESOURCE MAPPING
-            //    - Map containers to managed resources (scenarios, packages, models)
-            //    - Identify which resources are affected by container changes
-            //    - Determine impact on dependent resources
-            //
-            // 3. STATE TRANSITION TRIGGERS
-            //    - Trigger state transitions for failed containers
-            //    - Handle container recovery and restart scenarios
-            //    - Update resource states based on container health
-            //    - Escalate to recovery management for critical failures
-            //
-            // 4. HEALTH STATUS UPDATES
-            //    - Update resource health status based on container state
-            //    - Generate health check events and notifications
-            //    - Update monitoring and observability data
-            //    - Maintain health history for trend analysis
-            //
-            // 5. ASIL COMPLIANCE MONITORING
-            //    - Monitor ASIL-critical containers for safety violations
-            //    - Generate alerts for safety-critical container failures
-            //    - Implement timing constraints for container recovery
-            //    - Ensure safety systems remain operational
+                // Extract model name from annotations
+                if let Some(model_name) = self.extract_model_name_from_container(container) {
+                    model_containers
+                        .entry(model_name)
+                        .or_default()
+                        .push(container);
+                }
+            }
         }
 
-        println!("  Status: Container list processing completed (implementation pending)");
+        // Process each model and calculate its state based on container states
+        for (model_name, containers) in model_containers {
+            println!("  Processing model: {}", model_name);
+            let model_state = self.calculate_model_state(&containers).await;
+
+            // Store model state in ETCD
+            if let Err(e) = self
+                .store_model_state_in_etcd(&model_name, model_state)
+                .await
+            {
+                eprintln!("    Failed to store model state in ETCD: {:?}", e);
+            } else {
+                println!(
+                    "    Model '{}' state updated to: {:?}",
+                    model_name, model_state
+                );
+            }
+
+            // Trigger state transition if needed
+            self.trigger_model_state_transition(&model_name, model_state)
+                .await;
+        }
+
+        println!("  Status: Container list processing completed");
         println!("=====================================");
+    }
+
+    /// Extract model name from container annotations
+    ///
+    /// # Arguments
+    /// * `container` - Container information
+    ///
+    /// # Returns
+    /// * `Option<String>` - Model name if found in annotations
+    fn extract_model_name_from_container(
+        &self,
+        container: &common::monitoringserver::ContainerInfo,
+    ) -> Option<String> {
+        // Look for model name in annotations
+        // Common annotation keys: "model", "pullpiri.model", "piccolo.model"
+        container
+            .annotation
+            .get("model")
+            .or_else(|| container.annotation.get("pullpiri.model"))
+            .or_else(|| container.annotation.get("piccolo.model"))
+            .cloned()
+            .or_else(|| {
+                // Fallback: extract from container name if follows naming convention
+                // e.g., "model-name-container-1" -> "model-name"
+                container.names.first().and_then(|name| {
+                    if name.contains("-container-") {
+                        let parts: Vec<&str> = name.split("-container-").collect();
+                        Some(parts[0].trim_start_matches('/').to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    /// Calculate model state based on container states according to documentation section 4.2
+    ///
+    /// Model state conditions:
+    /// - Created: Initial state when model is created
+    /// - Paused: All containers are paused  
+    /// - Exited: All containers are exited
+    /// - Dead: One or more containers are dead OR model info query failed
+    /// - Running: Default state when above conditions are not met
+    ///
+    /// # Arguments
+    /// * `containers` - List of containers belonging to the model
+    ///
+    /// # Returns
+    /// * `ModelState` - Calculated model state
+    async fn calculate_model_state(
+        &self,
+        containers: &[&common::monitoringserver::ContainerInfo],
+    ) -> ModelState {
+        if containers.is_empty() {
+            return ModelState::Unknown;
+        }
+
+        let mut paused_count = 0;
+        let mut exited_count = 0;
+        let mut dead_count = 0;
+        let mut running_count = 0;
+        let total_containers = containers.len();
+
+        for container in containers {
+            let container_state = self.parse_container_state(container);
+            match container_state.as_str() {
+                "paused" => paused_count += 1,
+                "exited" => exited_count += 1,
+                "dead" => dead_count += 1,
+                "running" => running_count += 1,
+                _ => {} // Other states don't affect model state calculation
+            }
+        }
+
+        println!(
+            "    Container states - Running: {}, Paused: {}, Exited: {}, Dead: {}, Total: {}",
+            running_count, paused_count, exited_count, dead_count, total_containers
+        );
+
+        // Apply model state rules from documentation section 4.2
+        if dead_count > 0 {
+            // One or more containers are dead
+            ModelState::Failed // Using Failed instead of Dead as per proto definition
+        } else if paused_count == total_containers {
+            // All containers are paused
+            ModelState::Unknown // Using Unknown as closest match to Paused
+        } else if exited_count == total_containers {
+            // All containers are exited
+            ModelState::Succeeded // Using Succeeded as closest match to Exited
+        } else if running_count > 0 {
+            // At least one container is running - default to Running
+            ModelState::Running
+        } else {
+            // Default case
+            ModelState::Pending
+        }
+    }
+
+    /// Parse container state from the state HashMap
+    ///
+    /// # Arguments
+    /// * `container` - Container information
+    ///
+    /// # Returns
+    /// * `String` - Parsed container state
+    fn parse_container_state(&self, container: &common::monitoringserver::ContainerInfo) -> String {
+        // Container state is stored in a HashMap, common keys are:
+        // "Status", "State", "Running", "Paused", "Restarting", "Dead", "ExitCode"
+        if let Some(status) = container.state.get("Status") {
+            status.to_lowercase()
+        } else if let Some(state) = container.state.get("State") {
+            state.to_lowercase()
+        } else if container.state.get("Running") == Some(&"true".to_string()) {
+            "running".to_string()
+        } else if container.state.get("Paused") == Some(&"true".to_string()) {
+            "paused".to_string()
+        } else if container.state.get("Dead") == Some(&"true".to_string()) {
+            "dead".to_string()
+        } else if let Some(exit_code) = container.state.get("ExitCode") {
+            if exit_code == "0" {
+                "exited".to_string()
+            } else {
+                "dead".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    /// Store model state in ETCD following the format specified in documentation section 5
+    ///
+    /// Key format: /model/{model_name}/state
+    /// Value format: ModelState enum as string (e.g., "Running", "Failed")
+    ///
+    /// # Arguments
+    /// * `model_name` - Name of the model
+    /// * `model_state` - Current state of the model
+    ///
+    /// # Returns
+    /// * `common::Result<()>` - Success or error
+    async fn store_model_state_in_etcd(
+        &self,
+        model_name: &str,
+        model_state: ModelState,
+    ) -> common::Result<()> {
+        let key = format!("/model/{}/state", model_name);
+        let value = model_state.as_str_name();
+
+        println!("    Storing in ETCD - Key: {}, Value: {}", key, value);
+
+        match common::etcd::put(&key, value).await {
+            Ok(_) => {
+                println!("    Successfully stored model state in ETCD");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("    Failed to store model state in ETCD: {:?}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Trigger model state transition using the state machine
+    ///
+    /// # Arguments  
+    /// * `model_name` - Name of the model
+    /// * `target_state` - Target state for the model
+    async fn trigger_model_state_transition(&self, model_name: &str, target_state: ModelState) {
+        // Get current state from ETCD first
+        let key = format!("/model/{}/state", model_name);
+        let current_state_str = match common::etcd::get(&key).await {
+            Ok(value) => value,
+            Err(_) => {
+                // If not found, assume it's a new model starting from Unspecified
+                "MODEL_STATE_UNSPECIFIED".to_string()
+            }
+        };
+
+        let current_state =
+            ModelState::from_str_name(&current_state_str).unwrap_or(ModelState::Unspecified);
+
+        // Don't trigger transition if state hasn't changed
+        if current_state == target_state {
+            return;
+        }
+
+        // Create StateChange message for the state machine
+        // Use container_health_change as the event since this is triggered by container status changes
+        let state_change = StateChange {
+            resource_type: ResourceType::Model as i32,
+            resource_name: model_name.to_string(),
+            current_state: current_state.as_str_name().to_string(),
+            target_state: target_state.as_str_name().to_string(),
+            transition_id: format!(
+                "model-{}-{}",
+                model_name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            ),
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            source: "StateManager::ContainerProcessor".to_string(),
+        };
+
+        println!(
+            "    Triggering state transition: {} -> {}",
+            current_state.as_str_name(),
+            target_state.as_str_name()
+        );
+
+        // Process the state change through the state machine
+        self.process_state_change(state_change).await;
     }
 
     /// Main message processing loop for handling gRPC requests.
@@ -802,6 +1021,48 @@ async fn execute_action(command: ActionCommand) {
         "start_model_recreation" => {
             println!(" Starting model recreation for: {}", command.resource_key);
             // Would start complete model recreation process
+        }
+        "log_container_failure_update_model_state" => {
+            println!(
+                " Logging container failure and updating model state for: {}",
+                command.resource_key
+            );
+            // Would log container failures and update model state accordingly
+        }
+        "log_container_pause_update_model_state" => {
+            println!(
+                " Logging container pause and updating model state for: {}",
+                command.resource_key
+            );
+            // Would handle container pause scenarios
+        }
+        "log_container_exit_update_model_state" => {
+            println!(
+                " Logging container exit and updating model state for: {}",
+                command.resource_key
+            );
+            // Would handle container exit scenarios
+        }
+        "log_container_recovery_update_model_state" => {
+            println!(
+                " Logging container recovery and updating model state for: {}",
+                command.resource_key
+            );
+            // Would handle container recovery scenarios
+        }
+        "log_container_restart_update_model_state" => {
+            println!(
+                " Logging container restart and updating model state for: {}",
+                command.resource_key
+            );
+            // Would handle container restart scenarios
+        }
+        "initialize_model_from_containers" => {
+            println!(
+                " Initializing model from container states for: {}",
+                command.resource_key
+            );
+            // Would initialize a new model based on existing container states
         }
         _ => {
             println!(

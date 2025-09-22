@@ -425,6 +425,57 @@ impl StateMachine {
                 condition: Some("according_to_restart_policy".to_string()),
                 action: "start_model_recreation".to_string(),
             },
+            // Additional transitions for container state-based model transitions
+            StateTransition {
+                from_state: ModelState::Running as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Failed as i32,
+                condition: Some("containers_dead".to_string()),
+                action: "log_container_failure_update_model_state".to_string(),
+            },
+            StateTransition {
+                from_state: ModelState::Running as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Unknown as i32,
+                condition: Some("containers_paused".to_string()),
+                action: "log_container_pause_update_model_state".to_string(),
+            },
+            StateTransition {
+                from_state: ModelState::Running as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Succeeded as i32,
+                condition: Some("containers_exited".to_string()),
+                action: "log_container_exit_update_model_state".to_string(),
+            },
+            StateTransition {
+                from_state: ModelState::Failed as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Running as i32,
+                condition: Some("containers_recovered".to_string()),
+                action: "log_container_recovery_update_model_state".to_string(),
+            },
+            StateTransition {
+                from_state: ModelState::Unknown as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Running as i32,
+                condition: Some("containers_recovered".to_string()),
+                action: "log_container_recovery_update_model_state".to_string(),
+            },
+            StateTransition {
+                from_state: ModelState::Succeeded as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Running as i32,
+                condition: Some("containers_restarted".to_string()),
+                action: "log_container_restart_update_model_state".to_string(),
+            },
+            // Allow transitions from any state based on container analysis
+            StateTransition {
+                from_state: ModelState::Unspecified as i32,
+                event: "container_health_change".to_string(),
+                to_state: ModelState::Running as i32,
+                condition: Some("containers_running".to_string()),
+                action: "initialize_model_from_containers".to_string(),
+            },
         ];
 
         self.transition_tables
@@ -985,6 +1036,30 @@ impl StateMachine {
                 (x, y) if x == ModelState::Failed as i32 && y == ModelState::Pending as i32 => {
                     "manual_automatic_recovery".to_string()
                 }
+                // Additional container state-based transitions
+                (x, y)
+                    if (x == ModelState::Failed as i32
+                        || x == ModelState::Unknown as i32
+                        || x == ModelState::Succeeded as i32)
+                        && y == ModelState::Running as i32 =>
+                {
+                    "container_health_change".to_string()
+                }
+                (x, y)
+                    if x == ModelState::Unspecified as i32 && y == ModelState::Running as i32 =>
+                {
+                    "container_health_change".to_string()
+                }
+                // Override specific transitions that should use container health change when coming from Running
+                (x, y)
+                    if x == ModelState::Running as i32
+                        && (y == ModelState::Failed as i32
+                            || y == ModelState::Unknown as i32
+                            || y == ModelState::Succeeded as i32) =>
+                {
+                    // Check if this is a container-driven change vs normal operational change
+                    "container_health_change".to_string()
+                }
                 _ => format!("transition_{current_state}_{target_state}"),
             },
             _ => format!("transition_{current_state}_{target_state}"),
@@ -1037,6 +1112,13 @@ impl StateMachine {
             "retry_limit_reached" => false,
             "depends_on_actual_state" => true,
             "according_to_restart_policy" => true,
+            // Container state-based conditions
+            "containers_dead" => true,
+            "containers_paused" => true,
+            "containers_exited" => true,
+            "containers_recovered" => true,
+            "containers_running" => true,
+            "containers_restarted" => true,
             _ => true, // Default to allow transition for unknown conditions
         }
     }
