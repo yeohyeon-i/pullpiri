@@ -200,43 +200,22 @@ impl StateMachine {
     /// Initialize the state transition table for Package resources
     ///
     /// Configures all valid state transitions for Package resources, including:
-    /// - Download and installation states
-    /// - Verification and validation phases
-    /// - Update and rollback mechanisms
+    /// - Runtime state management
+    /// - Error handling and recovery
+    /// - Pause and resume operations
     /// - Cleanup and removal operations
     ///
     /// # Implementation Note
-    /// Package transitions typically involve more complex workflows due to
-    /// dependency management and rollback requirements.
+    /// Package transitions involve workflows for managing package lifecycle
+    /// with focus on runtime state changes and recovery mechanisms.
     fn initialize_package_transitions(&mut self) {
         let package_transitions = vec![
             StateTransition {
                 from_state: PackageState::Unspecified as i32,
                 event: "launch_request".to_string(),
-                to_state: PackageState::Initializing as i32,
-                condition: None,
-                action: "start_model_creation_allocate_resources".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Initializing as i32,
-                event: "initialization_complete".to_string(),
                 to_state: PackageState::Running as i32,
-                condition: Some("all_models_normal".to_string()),
-                action: "update_state_announce_availability".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Initializing as i32,
-                event: "partial_initialization_failure".to_string(),
-                to_state: PackageState::Degraded as i32,
-                condition: Some("critical_models_normal".to_string()),
-                action: "log_warning_activate_partial_functionality".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Initializing as i32,
-                event: "critical_initialization_failure".to_string(),
-                to_state: PackageState::Error as i32,
-                condition: Some("critical_models_failed".to_string()),
-                action: "log_error_attempt_recovery".to_string(),
+                condition: None,
+                action: "start_model_creation_and_run".to_string(),
             },
             StateTransition {
                 from_state: PackageState::Running as i32,
@@ -293,27 +272,6 @@ impl StateMachine {
                 to_state: PackageState::Running as i32,
                 condition: Some("depends_on_previous_state".to_string()),
                 action: "resume_models_restore_state".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Running as i32,
-                event: "update_request".to_string(),
-                to_state: PackageState::Updating as i32,
-                condition: None,
-                action: "start_update_process".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Updating as i32,
-                event: "update_successful".to_string(),
-                to_state: PackageState::Running as i32,
-                condition: None,
-                action: "activate_new_version_update_state".to_string(),
-            },
-            StateTransition {
-                from_state: PackageState::Updating as i32,
-                event: "update_failed".to_string(),
-                to_state: PackageState::Error as i32,
-                condition: Some("depends_on_rollback_settings".to_string()),
-                action: "rollback_or_error_handling".to_string(),
             },
         ];
 
@@ -858,27 +816,9 @@ impl StateMachine {
             ResourceType::Package => match (current_state, target_state) {
                 (x, y)
                     if x == PackageState::Unspecified as i32
-                        && y == PackageState::Initializing as i32 =>
-                {
-                    "launch_request".to_string()
-                }
-                (x, y)
-                    if x == PackageState::Initializing as i32
                         && y == PackageState::Running as i32 =>
                 {
-                    "initialization_complete".to_string()
-                }
-                (x, y)
-                    if x == PackageState::Initializing as i32
-                        && y == PackageState::Degraded as i32 =>
-                {
-                    "partial_initialization_failure".to_string()
-                }
-                (x, y)
-                    if x == PackageState::Initializing as i32
-                        && y == PackageState::Error as i32 =>
-                {
-                    "critical_initialization_failure".to_string()
+                    "launch_request".to_string()
                 }
                 (x, y)
                     if x == PackageState::Running as i32 && y == PackageState::Degraded as i32 =>
@@ -890,11 +830,6 @@ impl StateMachine {
                 }
                 (x, y) if x == PackageState::Running as i32 && y == PackageState::Paused as i32 => {
                     "pause_request".to_string()
-                }
-                (x, y)
-                    if x == PackageState::Running as i32 && y == PackageState::Updating as i32 =>
-                {
-                    "update_request".to_string()
                 }
                 (x, y)
                     if x == PackageState::Degraded as i32 && y == PackageState::Running as i32 =>
@@ -914,14 +849,6 @@ impl StateMachine {
                 }
                 (x, y) if x == PackageState::Paused as i32 && y == PackageState::Running as i32 => {
                     "resume_request".to_string()
-                }
-                (x, y)
-                    if x == PackageState::Updating as i32 && y == PackageState::Running as i32 =>
-                {
-                    "update_successful".to_string()
-                }
-                (x, y) if x == PackageState::Updating as i32 && y == PackageState::Error as i32 => {
-                    "update_failed".to_string()
                 }
                 _ => format!("transition_{current_state}_{target_state}"),
             },
