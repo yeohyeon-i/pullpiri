@@ -1,6 +1,9 @@
 use std::{thread, time::Duration};
 
-use crate::{grpc::sender::pharos::request_network_pod, runtime::bluechi};
+use crate::{
+    grpc::sender::pharos::request_network_pod, grpc::sender::statemanager::StateManagerSender,
+    runtime::bluechi,
+};
 use common::{
     actioncontroller::PodStatus as Status,
     spec::artifact::{Network, Node, Package, Scenario},
@@ -19,7 +22,8 @@ pub struct ActionControllerManager {
     pub bluechi_nodes: Vec<String>,
     /// List of nodes managed by NodeAgent
     pub nodeagent_nodes: Vec<String>,
-    // Add other fields as needed
+    /// StateManager sender for reporting state changes
+    state_manager_sender: StateManagerSender,
 }
 
 impl ActionControllerManager {
@@ -55,6 +59,7 @@ impl ActionControllerManager {
         Self {
             bluechi_nodes,
             nodeagent_nodes,
+            state_manager_sender: StateManagerSender::new(),
         }
     }
 
@@ -186,6 +191,23 @@ impl ActionControllerManager {
                     // Ignore unknown action for now, or optionally return error:
                     // return Err(format!("Unknown action '{}'", action).into());
                 }
+            }
+        }
+
+        // Report scenario completion to StateManager (allowed → completed)
+        let transition_id = format!("action-{}", scenario_name);
+        let mut sender = self.state_manager_sender.clone();
+        match sender
+            .report_scenario_completion(scenario_name, &transition_id)
+            .await
+        {
+            Ok(_) => println!("Successfully reported scenario completion to StateManager"),
+            Err(e) => {
+                println!(
+                    "Failed to report scenario completion to StateManager: {:?}",
+                    e
+                );
+                // Don't fail the entire operation if StateManager reporting fails
             }
         }
 

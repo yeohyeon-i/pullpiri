@@ -364,6 +364,82 @@ impl StateManagerSender {
 
         self.send_state_change(state_change).await
     }
+
+    /// Reports scenario completion to StateManager (allowed → completed transition).
+    ///
+    /// This method is used by ActionController to report when a scenario execution
+    /// has been completed successfully according to StateManager_Scenario.md specification.
+    ///
+    /// # Arguments
+    /// * `scenario_name` - Name of the scenario that was completed
+    /// * `transition_id` - Original transition ID from the action request
+    ///
+    /// # Returns
+    /// * `Result<tonic::Response<StateChangeResponse>, Status>` - StateManager response
+    ///
+    /// # Example Usage
+    /// ```rust
+    /// sender.report_scenario_completion("emergency-brake", "action-123").await?;
+    /// ```
+    pub async fn report_scenario_completion(
+        &mut self,
+        scenario_name: &str,
+        transition_id: &str,
+    ) -> Result<tonic::Response<StateChangeResponse>, Status> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let state_change = StateChange {
+            resource_type: ResourceType::Scenario as i32,
+            resource_name: scenario_name.to_string(),
+            current_state: "allowed".to_string(),
+            target_state: "completed".to_string(),
+            transition_id: format!("scenario-completion-{}", transition_id),
+            timestamp_ns: timestamp,
+            source: "actioncontroller".to_string(),
+        };
+
+        self.send_state_change(state_change).await
+    }
+
+    /// Reports scenario state change to StateManager.
+    ///
+    /// General method for reporting scenario state transitions from ActionController.
+    ///
+    /// # Arguments
+    /// * `scenario_name` - Name of the scenario
+    /// * `current_state` - Current scenario state
+    /// * `target_state` - Target scenario state
+    /// * `transition_id` - Unique transition identifier
+    ///
+    /// # Returns
+    /// * `Result<tonic::Response<StateChangeResponse>, Status>` - StateManager response
+    pub async fn report_scenario_state_change(
+        &mut self,
+        scenario_name: &str,
+        current_state: &str,
+        target_state: &str,
+        transition_id: &str,
+    ) -> Result<tonic::Response<StateChangeResponse>, Status> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let state_change = StateChange {
+            resource_type: ResourceType::Scenario as i32,
+            resource_name: scenario_name.to_string(),
+            current_state: current_state.to_string(),
+            target_state: target_state.to_string(),
+            transition_id: transition_id.to_string(),
+            timestamp_ns: timestamp,
+            source: "actioncontroller".to_string(),
+        };
+
+        self.send_state_change(state_change).await
+    }
 }
 
 // ========================================

@@ -1,4 +1,5 @@
 use crate::grpc::sender::actioncontroller::FilterGatewaySender;
+use crate::grpc::sender::statemanager::StateManagerSender;
 use crate::vehicle::dds::DdsData;
 use common::spec::artifact::Scenario;
 use common::Result;
@@ -16,6 +17,8 @@ pub struct Filter {
     is_active: bool,
     /// gRPC sender for action controller
     sender: FilterGatewaySender,
+    /// gRPC sender for state manager
+    state_manager_sender: StateManagerSender,
 }
 
 impl Filter {
@@ -25,8 +28,8 @@ impl Filter {
     ///
     /// * `scenario_name` - Name of the scenario
     /// * `scenario` - Full scenario definition
-    /// * `rx_dds` - Receiver for DDS data
-    /// * `sender` - Sender for gRPC calls
+    /// * `is_active` - Flag to indicate if the filter is active
+    /// * `sender` - Sender for gRPC calls to ActionController
     ///
     /// # Returns
     ///
@@ -42,6 +45,7 @@ impl Filter {
             scenario,
             is_active,
             sender,
+            state_manager_sender: StateManagerSender::new(),
         }
     }
 
@@ -137,6 +141,21 @@ impl Filter {
 
         if check {
             println!("Condition met for scenario: {}", self.scenario_name);
+
+            // Report condition satisfaction to StateManager (waiting → satisfied)
+            if let Err(e) = self
+                .state_manager_sender
+                .report_condition_satisfied(&self.scenario_name)
+                .await
+            {
+                println!(
+                    "Failed to report condition satisfied to StateManager: {:?}",
+                    e
+                );
+                // Don't fail the entire operation if StateManager reporting fails
+            }
+
+            // Trigger action in ActionController
             self.sender
                 .trigger_action(self.scenario_name.clone())
                 .await?;
@@ -187,6 +206,28 @@ impl Filter {
     /// * `bool` - Filter active status
     pub fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    /// Reports condition registration to StateManager (idle → waiting transition).
+    ///
+    /// This should be called when a scenario condition is first registered.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Success or error result
+    pub async fn report_condition_registration(&mut self) -> Result<()> {
+        if let Err(e) = self
+            .state_manager_sender
+            .report_condition_registration(&self.scenario_name)
+            .await
+        {
+            println!(
+                "Failed to report condition registration to StateManager: {:?}",
+                e
+            );
+            return Err(format!("Failed to report condition registration: {}", e).into());
+        }
+        Ok(())
     }
 
     /// Process DDS data and check conditions

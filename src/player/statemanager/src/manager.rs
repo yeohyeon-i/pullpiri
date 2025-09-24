@@ -342,6 +342,43 @@ impl StateManagerManager {
                 );
             }
 
+            // Save state to ETCD based on resource type
+            match resource_type {
+                ResourceType::Scenario => {
+                    // Save scenario state to ETCD
+                    let scenario_state = match ScenarioState::try_from(result.new_state) {
+                        Ok(state) => state,
+                        Err(_) => {
+                            println!("    Warning: Unknown scenario state: {}", result.new_state);
+                            ScenarioState::Idle // Default fallback
+                        }
+                    };
+
+                    if let Err(e) = self
+                        .save_scenario_state_to_etcd(&state_change.resource_name, scenario_state)
+                        .await
+                    {
+                        println!("    Failed to save scenario state to ETCD: {:?}", e);
+                    } else {
+                        println!("    Successfully saved scenario state to ETCD");
+                    }
+                }
+                ResourceType::Package => {
+                    // Package state handling already exists in other parts of the code
+                    println!("    Package state handling - delegated to package evaluation logic");
+                }
+                ResourceType::Model => {
+                    // Model state handling already exists in other parts of the code
+                    println!("    Model state handling - delegated to container processing logic");
+                }
+                _ => {
+                    println!(
+                        "    No ETCD storage implemented for resource type: {:?}",
+                        resource_type
+                    );
+                }
+            }
+
             println!("  Status: State change processing completed successfully");
         } else {
             // ========================================
@@ -597,6 +634,33 @@ impl StateManagerManager {
             return Err(format!(
                 "Failed to save package state for {}: {:?}",
                 package_name, e
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Saves scenario state to ETCD using the format specified in StateManager_Scenario.md
+    ///
+    /// Format: <scenario_name, state> as specified in the document
+    async fn save_scenario_state_to_etcd(
+        &self,
+        scenario_name: &str,
+        scenario_state: common::statemanager::ScenarioState,
+    ) -> std::result::Result<(), String> {
+        let key = format!("scenario/{}", scenario_name);
+        let value = scenario_state.as_str_name();
+
+        println!(
+            "    Saving scenario state to ETCD - Key: {}, Value: {}",
+            key, value
+        );
+
+        if let Err(e) = common::etcd::put(&key, value).await {
+            println!("    Failed to save scenario state: {:?}", e);
+            return Err(format!(
+                "Failed to save scenario state for {}: {:?}",
+                scenario_name, e
             ));
         }
 

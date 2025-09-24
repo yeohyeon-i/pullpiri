@@ -325,6 +325,80 @@ impl StateManagerSender {
 
         self.send_state_change(state_change).await
     }
+
+    /// Reports scenario state change to StateManager.
+    ///
+    /// This method is used by FilterGateway to report scenario state transitions
+    /// according to the StateManager_Scenario.md specification.
+    ///
+    /// # Arguments
+    /// * `scenario_name` - Name of the scenario
+    /// * `current_state` - Current scenario state
+    /// * `target_state` - Target scenario state
+    /// * `transition_id` - Unique transition identifier
+    ///
+    /// # Returns
+    /// * `Result<tonic::Response<StateChangeResponse>, Status>` - StateManager response
+    pub async fn report_scenario_state_change(
+        &mut self,
+        scenario_name: &str,
+        current_state: &str,
+        target_state: &str,
+        transition_id: &str,
+    ) -> Result<tonic::Response<StateChangeResponse>, Status> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let state_change = StateChange {
+            resource_type: ResourceType::Scenario as i32,
+            resource_name: scenario_name.to_string(),
+            current_state: current_state.to_string(),
+            target_state: target_state.to_string(),
+            transition_id: transition_id.to_string(),
+            timestamp_ns: timestamp,
+            source: "filtergateway".to_string(),
+        };
+
+        self.send_state_change(state_change).await
+    }
+
+    /// Reports condition registration to StateManager (idle → waiting transition).
+    ///
+    /// Called when FilterGateway registers a condition for a scenario.
+    ///
+    /// # Arguments
+    /// * `scenario_name` - Name of the scenario
+    ///
+    /// # Returns
+    /// * `Result<tonic::Response<StateChangeResponse>, Status>` - StateManager response
+    pub async fn report_condition_registration(
+        &mut self,
+        scenario_name: &str,
+    ) -> Result<tonic::Response<StateChangeResponse>, Status> {
+        let transition_id = format!("condition-register-{}", scenario_name);
+        self.report_scenario_state_change(scenario_name, "idle", "waiting", &transition_id)
+            .await
+    }
+
+    /// Reports condition satisfaction to StateManager (waiting → satisfied transition).
+    ///
+    /// Called when FilterGateway determines that scenario conditions are met.
+    ///
+    /// # Arguments
+    /// * `scenario_name` - Name of the scenario
+    ///
+    /// # Returns
+    /// * `Result<tonic::Response<StateChangeResponse>, Status>` - StateManager response
+    pub async fn report_condition_satisfied(
+        &mut self,
+        scenario_name: &str,
+    ) -> Result<tonic::Response<StateChangeResponse>, Status> {
+        let transition_id = format!("condition-satisfied-{}", scenario_name);
+        self.report_scenario_state_change(scenario_name, "waiting", "satisfied", &transition_id)
+            .await
+    }
 }
 
 // ========================================
