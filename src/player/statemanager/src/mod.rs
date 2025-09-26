@@ -15,4 +15,4 @@ pub mod types;
 // Re-export main types for easier access
 pub use manager::StateManagerManager;
 pub use state_machine::StateMachine;
-pub use types::{TransitionResult, ResourceState};
+pub use types::{ResourceState, TransitionResult};

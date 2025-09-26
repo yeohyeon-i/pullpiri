@@ -105,7 +105,6 @@ impl ActionControllerManager {
             }
         };
 
-
         // 3. base64 디코드 및 NodeInfo 디코드
         let buf = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
         let node_info = common::apiserver::NodeInfo::decode(buf.as_slice())?;
@@ -121,7 +120,6 @@ impl ActionControllerManager {
 
         println!("Node {} role loaded from etcd: {}", node_name, role);
         Ok(role)
-
     }
 
     /// Processes a trigger action request for a specific scenario
