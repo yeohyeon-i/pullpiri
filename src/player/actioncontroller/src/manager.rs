@@ -43,6 +43,7 @@ impl ActionControllerManager {
         Self {
             bluechi_nodes: Vec::new(),
             nodeagent_nodes: Vec::new(),
+            state_sender: StateManagerSender::new(),
         }
     }
 

@@ -59,7 +59,45 @@ pub async fn apply(body: &str) -> common::Result<String> {
             println!("apply: etcd write elapsed for {} = {:?}", key, etcd_elapsed);
 
             match kind {
-                "Scenario" => scenario_str = artifact_str,
+                "Scenario" => {
+                    scenario_str = artifact_str;
+
+                    // Set initial scenario state to idle via StateManager
+                    println!("🔄 SCENARIO STATE INITIALIZATION: ApiServer Setting Initial State");
+                    println!("   📋 Scenario: {}", name);
+                    println!("   🔄 Initial State: → idle");
+                    println!("   🔍 Reason: New scenario artifact received and stored in etcd");
+
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as i64;
+
+                    let state_change = common::statemanager::StateChange {
+                        resource_type: common::statemanager::ResourceType::Scenario as i32,
+                        resource_name: name.clone(),
+                        current_state: "".to_string(), // No previous state for new scenario
+                        target_state: "idle".to_string(),
+                        transition_id: format!("apiserver-scenario-init-{}", timestamp),
+                        timestamp_ns: timestamp,
+                        source: "apiserver".to_string(),
+                    };
+
+                    println!("   📤 Sending StateChange to StateManager:");
+                    println!("      • Resource Type: SCENARIO");
+                    println!("      • Resource Name: {}", state_change.resource_name);
+                    println!("      • Target State: {}", state_change.target_state);
+                    println!("      • Transition ID: {}", state_change.transition_id);
+                    println!("      • Source: {}", state_change.source);
+
+                    let mut state_sender =
+                        crate::grpc::sender::statemanager::StateManagerSender::new();
+                    if let Err(e) = state_sender.send_state_change(state_change).await {
+                        println!("   ❌ Failed to send state change to StateManager: {:?}", e);
+                    } else {
+                        println!("   ✅ Successfully set scenario {} to idle state", name);
+                    }
+                }
                 "Package" => package_str = artifact_str,
                 _ => continue,
             };

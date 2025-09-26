@@ -1,8 +1,10 @@
 use crate::filter::Filter;
 use crate::grpc::sender::actioncontroller::FilterGatewaySender;
+use crate::grpc::sender::statemanager::StateManagerSender;
 use crate::vehicle::dds::DdsData;
 use crate::vehicle::VehicleManager;
 use common::spec::artifact::Scenario;
+use common::statemanager::{ResourceType, StateChange};
 use common::{spec::artifact::Artifact, Result};
 // use dust_dds::infrastructure::wait_set::Condition;
 use std::sync::Arc;
@@ -335,6 +337,45 @@ impl FilterGatewayManager {
             let elapsed = start.elapsed();
             println!("launch_scenario_filter: elapsed = {:?}", elapsed);
             return Ok(());
+        }
+
+        // Set scenario state from idle to waiting when conditions are registered
+        println!("🔄 SCENARIO STATE TRANSITION: FilterGateway Condition Registration");
+        println!("   📋 Scenario: {}", scenario.get_name());
+        println!("   🔄 State Change: idle → waiting");
+        println!("   🔍 Reason: Scenario conditions registered in FilterGateway");
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let state_change = StateChange {
+            resource_type: ResourceType::Scenario as i32,
+            resource_name: scenario.get_name().clone(),
+            current_state: "idle".to_string(),
+            target_state: "waiting".to_string(),
+            transition_id: format!("filtergateway-condition-registered-{}", timestamp),
+            timestamp_ns: timestamp,
+            source: "filtergateway".to_string(),
+        };
+
+        println!("   📤 Sending StateChange to StateManager:");
+        println!("      • Resource Type: SCENARIO");
+        println!("      • Resource Name: {}", state_change.resource_name);
+        println!("      • Current State: {}", state_change.current_state);
+        println!("      • Target State: {}", state_change.target_state);
+        println!("      • Transition ID: {}", state_change.transition_id);
+        println!("      • Source: {}", state_change.source);
+
+        let mut state_sender = StateManagerSender::new();
+        if let Err(e) = state_sender.send_state_change(state_change).await {
+            println!("   ❌ Failed to send state change to StateManager: {:?}", e);
+        } else {
+            println!(
+                "   ✅ Successfully notified StateManager: scenario {} idle → waiting",
+                scenario.get_name()
+            );
         }
 
         let sender = {

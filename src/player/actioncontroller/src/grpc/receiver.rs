@@ -77,54 +77,11 @@ impl ActionControllerConnection for ActionControllerReceiver {
         let scenario_name = request.into_inner().scenario_name;
         println!("trigger_action scenario: {}", scenario_name);
 
-        // 🔍 COMMENT 3: ActionController condition satisfaction check
-        // When ActionController receives trigger_action from FilterGateway,
-        // it processes the scenario and should notify StateManager of scenario
-        // state changes (e.g., from "waiting" to "satisfied" after conditions are met).
-        // State change requests would be sent via StateManagerSender.
-
         println!("🔄 SCENARIO STATE TRANSITION: ActionController Processing");
         println!("   📋 Scenario: {}", scenario_name);
-        println!("   🔄 State Change: waiting → satisfied");
         println!("   🔍 Reason: ActionController received trigger_action from FilterGateway");
-
-        // Send state change to StateManager: waiting -> satisfied
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-
-        let state_change = StateChange {
-            resource_type: ResourceType::Scenario as i32,
-            resource_name: scenario_name.clone(),
-            current_state: "waiting".to_string(),
-            target_state: "satisfied".to_string(),
-            transition_id: format!("actioncontroller-condition-satisfied-{}", timestamp),
-            timestamp_ns: timestamp,
-            source: "actioncontroller".to_string(),
-        };
-
-        println!("   📤 Sending StateChange to StateManager:");
-        println!("      • Resource Type: SCENARIO");
-        println!("      • Resource Name: {}", state_change.resource_name);
-        println!("      • Current State: {}", state_change.current_state);
-        println!("      • Target State: {}", state_change.target_state);
-        println!("      • Transition ID: {}", state_change.transition_id);
-        println!("      • Source: {}", state_change.source);
-
-        if let Err(e) = self
-            .state_sender
-            .clone()
-            .send_state_change(state_change)
-            .await
-        {
-            println!("   ❌ Failed to send state change to StateManager: {:?}", e);
-        } else {
-            println!(
-                "   ✅ Successfully notified StateManager: scenario {} waiting → satisfied",
-                scenario_name
-            );
-        }
+        println!("   📝 Note: ActionController does not change state from waiting→satisfied");
+        println!("          FilterGateway handles this transition when conditions are met");
 
         println!("   🎯 Processing scenario actions...");
         let result = match self.manager.trigger_manager_action(&scenario_name).await {
