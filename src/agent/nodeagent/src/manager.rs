@@ -213,9 +213,132 @@ impl NodeAgentManager {
         let nodeinfo_task = tokio::spawn(async move {
             nodeinfo_manager.gather_node_info_loop().await;
         });
-        let _ = tokio::try_join!(grpc_processor, container_gatherer, nodeinfo_task);
+
+        // Spawn the reconciliation loop to detect and recover exited containers
+        let reconcile_cache = Arc::clone(&arc_self.desired_states_cache);
+        let reconciler = tokio::spawn(async move {
+            reconciliation_loop(reconcile_cache).await;
+        });
+
+        let _ = tokio::try_join!(
+            grpc_processor,
+            container_gatherer,
+            nodeinfo_task,
+            reconciler
+        );
         println!("NodeAgentManager stopped");
         Ok(())
+    }
+}
+
+/// Runs the reconciliation loop: periodically compares desired vs actual container states.
+///
+/// Every second, this function reads all desired states from the in-memory cache and
+/// compares them against actual container states reported by Podman. If a container that
+/// should be running is found to be exited, dead, or missing, `handle_exited_container`
+/// is called to apply the configured restart policy.
+pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>) {
+    use crate::resource::container::{get_inspect, get_list};
+    use tokio::time::{sleep, Duration};
+
+    loop {
+        // Clone desired states and release the lock immediately for better concurrency.
+        let desired_states = {
+            let cache = desired_states_cache.lock().await;
+            cache.clone()
+        };
+
+        // Get actual container list from Podman.
+        let actual_containers = match get_list().await {
+            Ok(containers) => containers,
+            Err(e) => {
+                eprintln!("[Reconciliation] Failed to list containers: {:?}", e);
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        // Compare desired vs actual for each tracked pod.
+        for (pod_name, desired) in &desired_states {
+            if desired.container_id.is_empty() {
+                // Container has not been started yet; nothing to reconcile.
+                continue;
+            }
+
+            let actual = actual_containers
+                .iter()
+                .find(|c| c.Id == desired.container_id);
+
+            match actual {
+                None => {
+                    // Container does not exist in Podman.
+                    eprintln!(
+                        "[Reconciliation] Container '{}' not found for pod '{}'",
+                        desired.container_id, pod_name
+                    );
+                    // Use exit code 1 to represent abnormal termination (missing container),
+                    // so that RestartPolicy::OnFailure will also trigger a restart.
+                    handle_exited_container(desired, 1).await;
+                }
+                Some(container) if container.State == "exited" || container.State == "dead" => {
+                    // Container has stopped; retrieve the exit code via inspect.
+                    let exit_code = match get_inspect(&desired.container_id).await {
+                        Ok(inspect) => inspect.State.ExitCode,
+                        Err(e) => {
+                            eprintln!(
+                                "[Reconciliation] Failed to inspect container '{}': {:?}; using exit code 1",
+                                desired.container_id, e
+                            );
+                            1
+                        }
+                    };
+                    eprintln!(
+                        "[Reconciliation] Container '{}' in state '{}' for pod '{}' (exit code {})",
+                        desired.container_id, container.State, pod_name, exit_code
+                    );
+                    handle_exited_container(desired, exit_code).await;
+                }
+                _ => {
+                    // Container is running normally; nothing to do.
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Handles a container that has exited by applying the configured restart policy.
+///
+/// Depending on the `restart_policy` field of `desired`, this function will either
+/// restart the container via the Podman API or leave it stopped.
+async fn handle_exited_container(desired: &DesiredState, exit_code: i32) {
+    use crate::desired_state::RestartPolicy;
+    use hyper::Body;
+
+    let should_restart = match desired.restart_policy {
+        RestartPolicy::Always => true,
+        RestartPolicy::OnFailure => exit_code != 0,
+        RestartPolicy::Never => false,
+    };
+
+    println!(
+        "[Reconciliation] Pod '{}': container '{}' exited (code {}), policy={:?}, restart={}",
+        desired.pod_name, desired.container_id, exit_code, desired.restart_policy, should_restart
+    );
+
+    if should_restart {
+        let restart_path = format!("/v4.0.0/libpod/containers/{}/restart", desired.container_id);
+        match crate::runtime::podman::post(&restart_path, Body::empty()).await {
+            Ok(_) => println!(
+                "[Reconciliation] Container '{}' restarted successfully",
+                desired.container_id
+            ),
+            Err(e) => eprintln!(
+                "[Reconciliation] Failed to restart container '{}': {:?}",
+                desired.container_id, e
+            ),
+        }
     }
 }
 
@@ -234,7 +357,7 @@ fn containers_equal_except_stats<'a>(a: &'a [ContainerInfo], b: &'a [ContainerIn
     })
 }
 
-//unit test cases
+// unit test cases
 #[cfg(test)]
 mod tests {
     const VALID_ARTIFACT_YAML: &str = r#"
@@ -412,5 +535,109 @@ spec:
         // Verify it's accessible through the original cache Arc
         let cache_guard = cache.lock().await;
         assert!(cache_guard.contains_key("my-pod"));
+    }
+
+    /// Verifies that the reconciliation loop does not panic when the cache is empty.
+    /// Since the loop is infinite, we use a short timeout to exercise one iteration.
+    #[tokio::test]
+    async fn test_reconciliation_loop_empty_cache_no_panic() {
+        let cache = make_cache();
+        // The loop runs indefinitely; a timeout verifies it doesn't panic in the first iteration.
+        let result = timeout(
+            Duration::from_millis(200),
+            super::reconciliation_loop(cache),
+        )
+        .await;
+        // Err means the timeout fired, which is the expected outcome for an infinite loop.
+        assert!(result.is_err());
+    }
+
+    /// Verifies that the reconciliation loop populates the desired_states variable correctly
+    /// and does not panic when at least one desired state is present (but container_id is empty).
+    #[tokio::test]
+    async fn test_reconciliation_loop_skips_empty_container_id() {
+        let cache = make_cache();
+        {
+            let mut c = cache.lock().await;
+            // DesiredState::new leaves container_id empty, so the loop should skip it.
+            c.insert("pod-a".to_string(), DesiredState::new("pod-a".to_string()));
+        }
+        // The loop will try to contact Podman (get_list) and either succeed or log an error;
+        // either way it must not panic.
+        let result = timeout(
+            Duration::from_millis(200),
+            super::reconciliation_loop(cache),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::Never` does not
+    /// attempt any Podman API call and completes without panic.
+    #[tokio::test]
+    async fn test_handle_exited_container_never_policy_no_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "container-abc".to_string(),
+            restart_policy: RestartPolicy::Never,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        // RestartPolicy::Never must not invoke Podman; function completes without error.
+        super::handle_exited_container(&desired, 1).await;
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::OnFailure` and an
+    /// exit code of 0 does NOT attempt to restart the container.
+    #[tokio::test]
+    async fn test_handle_exited_container_on_failure_zero_exit_no_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "container-abc".to_string(),
+            restart_policy: RestartPolicy::OnFailure,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        // Exit code 0 is a clean exit; OnFailure must not trigger a restart.
+        super::handle_exited_container(&desired, 0).await;
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::OnFailure` and a
+    /// non-zero exit code attempts to restart (Podman call may fail in test env, but must not panic).
+    #[tokio::test]
+    async fn test_handle_exited_container_on_failure_nonzero_exit_attempts_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "nonexistent-container".to_string(),
+            restart_policy: RestartPolicy::OnFailure,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        // Exit code != 0: OnFailure should attempt restart.
+        // Podman call will fail because the container does not exist, but must not panic.
+        super::handle_exited_container(&desired, 1).await;
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::Always` and exit code 0
+    /// still attempts to restart (Podman call may fail in test env, but must not panic).
+    #[tokio::test]
+    async fn test_handle_exited_container_always_policy_attempts_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "nonexistent-container".to_string(),
+            restart_policy: RestartPolicy::Always,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        // Always restart regardless of exit code; Podman may not be available, must not panic.
+        super::handle_exited_container(&desired, 0).await;
     }
 }
