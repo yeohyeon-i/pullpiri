@@ -124,7 +124,9 @@ mod tests {
         HeartbeatRequest, HeartbeatResponse, NodeRegistrationRequest, NodeRegistrationResponse,
         StatusAck, StatusReport,
     };
+    use std::sync::Arc;
     use tokio::sync::mpsc;
+    use tokio::sync::Mutex;
     use tonic::{Request, Status};
 
     const VALID_ARTIFACT_YAML: &str = r#"
@@ -178,6 +180,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let request = HandleYamlRequest {
@@ -205,6 +208,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let request = HandleYamlRequest {
@@ -229,6 +233,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let request = NodeRegistrationRequest {
@@ -261,6 +266,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let request = StatusReport {
@@ -287,6 +293,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let request = HeartbeatRequest {
@@ -316,6 +323,7 @@ spec:
             "test-node".to_string(),
             "test-host".to_string(),
             "192.168.1.100".to_string(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
 
         let mut config_map = std::collections::HashMap::new();

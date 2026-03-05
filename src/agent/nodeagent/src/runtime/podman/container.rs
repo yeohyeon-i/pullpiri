@@ -180,9 +180,11 @@ async fn create_container(
     Ok(container_id)
 }
 
-pub async fn start(pod_yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start(pod_yaml: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let (pod_name, spec) = parse_pod(pod_yaml)?;
     let host_network = spec["hostNetwork"].as_bool().unwrap_or(false);
+
+    let mut container_ids = Vec::new();
 
     if let Some(containers) = spec["containers"].as_array() {
         for container in containers.iter() {
@@ -194,10 +196,11 @@ pub async fn start(pod_yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
             post(&start_path, Body::empty()).await?;
 
             println!("Container {} started successfully", container_id);
+            container_ids.push(container_id);
         }
     }
 
-    Ok(())
+    Ok(container_ids)
 }
 
 pub async fn stop(pod_yaml: &str) -> Result<(), Box<dyn std::error::Error>> {

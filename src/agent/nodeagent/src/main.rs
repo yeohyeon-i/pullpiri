@@ -1,7 +1,7 @@
 /*
-* SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
-* SPDX-License-Identifier: Apache-2.0
-*/
+ * SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 //! NodeAgent main entry point
 //!
 //! This file sets up the asynchronous runtime, initializes the manager and gRPC server,
@@ -9,15 +9,20 @@
 
 use clap::Parser;
 use common::nodeagent::fromapiserver::{HandleYamlRequest, NodeRegistrationRequest};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 pub mod config;
+pub mod desired_state;
 pub mod grpc;
 pub mod manager;
 pub mod resource;
 pub mod runtime;
 
+use crate::desired_state::DesiredState;
 use common::nodeagent::node_agent_connection_server::NodeAgentConnectionServer;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 
 /// Launches the NodeAgentManager in an asynchronous task.
 ///
@@ -27,8 +32,10 @@ async fn launch_manager(
     rx_grpc: Receiver<HandleYamlRequest>,
     hostname: String,
     config: config::Config,
+    desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>,
 ) {
-    let mut manager = manager::NodeAgentManager::new(rx_grpc, hostname.clone()).await;
+    let mut manager =
+        manager::NodeAgentManager::new(rx_grpc, hostname.clone(), desired_states_cache).await;
 
     match manager.initialize().await {
         Ok(_) => {
@@ -102,7 +109,12 @@ async fn launch_manager(
 /// Initializes the NodeAgent gRPC server.
 ///
 /// Sets up the gRPC service and starts listening for incoming requests.
-async fn initialize(tx_grpc: Sender<HandleYamlRequest>, hostname: String, config: config::Config) {
+async fn initialize(
+    tx_grpc: Sender<HandleYamlRequest>,
+    hostname: String,
+    config: config::Config,
+    desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>,
+) {
     use tonic::transport::Server;
 
     // Use IP address from config file
@@ -116,6 +128,7 @@ async fn initialize(tx_grpc: Sender<HandleYamlRequest>, hostname: String, config
         node_id,
         hostname.clone(),
         host_ip.clone(),
+        desired_states_cache,
     );
 
     // Use hostname from config if available
@@ -195,9 +208,18 @@ async fn main() {
     }
     println!("Starting NodeAgent on host: {}", hostname);
 
+    // Create the shared desired states cache - used by both manager and gRPC receiver
+    let desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let (tx_grpc, rx_grpc) = channel::<HandleYamlRequest>(100);
-    let mgr = launch_manager(rx_grpc, hostname.clone(), app_config.clone());
-    let grpc = initialize(tx_grpc, hostname, app_config);
+    let mgr = launch_manager(
+        rx_grpc,
+        hostname.clone(),
+        app_config.clone(),
+        Arc::clone(&desired_states_cache),
+    );
+    let grpc = initialize(tx_grpc, hostname, app_config, desired_states_cache);
 
     tokio::join!(mgr, grpc);
 }
@@ -211,13 +233,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use crate::config::Config;
+    use crate::desired_state::DesiredState;
     use crate::{initialize, launch_manager};
     use common::nodeagent::fromapiserver::{HandleYamlRequest, NodeRegistrationRequest};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio::sync::mpsc::{channel, Receiver, Sender};
+    use tokio::sync::Mutex;
     use tokio::task::LocalSet;
     use tokio::time::{sleep, Duration};
+
+    fn make_cache() -> Arc<Mutex<HashMap<String, DesiredState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[tokio::test]
     async fn test_main_initializes_channels() {
@@ -234,7 +263,7 @@ mod tests {
         let config = Config::default();
         let local = LocalSet::new();
         local.spawn_local(async move {
-            let _ = launch_manager(rx_grpc, "hostname".to_string(), config).await;
+            let _ = launch_manager(rx_grpc, "hostname".to_string(), config, make_cache()).await;
         });
         tokio::select! {
             _ = local => {}
@@ -292,11 +321,31 @@ mod tests {
         let config = Config::default();
         let hostname = "testhost".to_string();
         // Should not panic or error
-        let fut = initialize(tx_grpc, hostname, config);
+        let fut = initialize(tx_grpc, hostname, config, make_cache());
         tokio::select! {
             _ = fut => {},
             _ = sleep(Duration::from_millis(200)) => {},
         }
         assert!(true);
+    }
+
+    #[tokio::test]
+    async fn test_desired_states_cache_shared_between_manager_and_receiver() {
+        let cache = make_cache();
+
+        // Simulate inserting a desired state (as actioncontroller would do on START)
+        {
+            let mut c = cache.lock().await;
+            c.insert(
+                "shared-pod".to_string(),
+                DesiredState::new("shared-pod".to_string()),
+            );
+        }
+
+        // Verify both references see the same data
+        let cache_clone = Arc::clone(&cache);
+        let guard = cache_clone.lock().await;
+        assert!(guard.contains_key("shared-pod"));
+        assert_eq!(guard.len(), 1);
     }
 }
