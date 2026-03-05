@@ -1,16 +1,18 @@
 /*
-* SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
-* SPDX-License-Identifier: Apache-2.0
-*/
+ * SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 //! NodeAgentManager: Asynchronous manager for NodeAgent
 //!
 //! This struct manages scenario requests received via gRPC, and provides
 //! a gRPC sender for communicating with the monitoring server or other services.
 //! It is designed to be thread-safe and run in an async context.
+use crate::desired_state::DesiredState;
 use crate::grpc::sender::NodeAgentSender;
 use common::monitoringserver::{ContainerInfo, ContainerList};
 use common::nodeagent::fromapiserver::HandleYamlRequest;
 use common::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -18,12 +20,16 @@ use tokio::sync::{mpsc, Mutex};
 ///
 /// Holds the gRPC receiver and sender, and manages the main event loop.
 pub struct NodeAgentManager {
-    /// Receiver for scenario information from gRPC
+    /// Receiver for scenario information from gRPC (used when bluechi runtime is enabled)
+    #[allow(dead_code)]
     rx_grpc: Arc<Mutex<mpsc::Receiver<HandleYamlRequest>>>,
     /// gRPC sender for monitoring server
     sender: Arc<Mutex<NodeAgentSender>>,
     // Add other shared state as needed
     hostname: String,
+    /// In-memory cache of desired states for self-healing.
+    /// Shared with the gRPC receiver so both can read/write the same state.
+    pub desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>,
 }
 
 impl NodeAgentManager {
@@ -31,11 +37,18 @@ impl NodeAgentManager {
     ///
     /// # Arguments
     /// * `rx_grpc` - Channel receiver for scenario information
-    pub async fn new(rx: mpsc::Receiver<HandleYamlRequest>, hostname: String) -> Self {
+    /// * `hostname` - The hostname of this node
+    /// * `desired_states_cache` - Shared in-memory cache for desired states
+    pub async fn new(
+        rx: mpsc::Receiver<HandleYamlRequest>,
+        hostname: String,
+        desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>,
+    ) -> Self {
         Self {
             rx_grpc: Arc::new(Mutex::new(rx)),
             sender: Arc::new(Mutex::new(NodeAgentSender::default())),
             hostname,
+            desired_states_cache,
         }
     }
 
@@ -57,13 +70,12 @@ impl NodeAgentManager {
     /// This function continuously receives scenario parameters from the gRPC channel
     /// and handles them (e.g., triggers actions, updates state, etc.).
     pub async fn process_grpc_requests(&self) -> Result<()> {
-        let arc_rx_grpc = Arc::clone(&self.rx_grpc);
-        let mut rx_grpc: tokio::sync::MutexGuard<'_, mpsc::Receiver<HandleYamlRequest>> =
-            arc_rx_grpc.lock().await;
-        /*while let Some(yaml_data) = rx_grpc.recv().await {
-            crate::runtime::bluechi::parse(yaml_data.yaml, self.hostname.clone()).await?;
-        }*/
-
+        // TODO: Implement gRPC request processing when the bluechi runtime is ready.
+        // let arc_rx_grpc = Arc::clone(&self.rx_grpc);
+        // let mut rx_grpc = arc_rx_grpc.lock().await;
+        // while let Some(yaml_data) = rx_grpc.recv().await {
+        //     crate::runtime::bluechi::parse(yaml_data.yaml, self.hostname.clone()).await?;
+        // }
         Ok(())
     }
 
@@ -267,6 +279,7 @@ spec:
       image: helloworld
   terminationGracePeriodSeconds: 0
 "#;
+    use crate::desired_state::DesiredState;
     use crate::manager::NodeAgentManager;
     use common::monitoringserver::{ContainerInfo, ContainerList, NodeInfo};
     use common::nodeagent::fromapiserver::HandleYamlRequest;
@@ -275,6 +288,10 @@ spec:
     use tokio::sync::mpsc;
     use tokio::sync::Mutex;
     use tokio::time::{timeout, Duration};
+
+    fn make_cache() -> Arc<Mutex<HashMap<String, DesiredState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn test_containers_equal_except_stats_true_and_false() {
@@ -328,7 +345,7 @@ spec:
         let (_tx, rx) = mpsc::channel(1);
         let hostname = "test-host".to_string();
 
-        let manager = NodeAgentManager::new(rx, hostname.clone()).await;
+        let manager = NodeAgentManager::new(rx, hostname.clone(), make_cache()).await;
 
         assert_eq!(manager.hostname, hostname);
     }
@@ -338,7 +355,7 @@ spec:
         let (_tx, rx) = mpsc::channel(1);
         let hostname = "test-host".to_string();
 
-        let mut manager = NodeAgentManager::new(rx, hostname).await;
+        let mut manager = NodeAgentManager::new(rx, hostname, make_cache()).await;
         let result = manager.initialize().await;
 
         assert!(result.is_ok());
@@ -350,7 +367,7 @@ spec:
         drop(_tx); // close sender so recv returns None immediately
         let hostname = "test-host".to_string();
 
-        let manager = NodeAgentManager::new(rx, hostname).await;
+        let manager = NodeAgentManager::new(rx, hostname, make_cache()).await;
         let result = manager.process_grpc_requests().await;
 
         assert!(result.is_ok());
@@ -361,7 +378,7 @@ spec:
         let (tx, rx) = mpsc::channel(1);
         let hostname = "test-host".to_string();
 
-        let manager = NodeAgentManager::new(rx, hostname.clone()).await;
+        let manager = NodeAgentManager::new(rx, hostname.clone(), make_cache()).await;
 
         let yaml_string = VALID_ARTIFACT_YAML.to_string();
         let request = HandleYamlRequest {
@@ -373,5 +390,27 @@ spec:
 
         let result = manager.process_grpc_requests().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_desired_states_cache_is_shared() {
+        let (_tx, rx) = mpsc::channel(1);
+        let hostname = "test-host".to_string();
+        let cache = make_cache();
+
+        let manager = NodeAgentManager::new(rx, hostname, Arc::clone(&cache)).await;
+
+        // Insert a value into cache via manager's reference
+        {
+            let mut c = manager.desired_states_cache.lock().await;
+            c.insert(
+                "my-pod".to_string(),
+                DesiredState::new("my-pod".to_string()),
+            );
+        }
+
+        // Verify it's accessible through the original cache Arc
+        let cache_guard = cache.lock().await;
+        assert!(cache_guard.contains_key("my-pod"));
     }
 }

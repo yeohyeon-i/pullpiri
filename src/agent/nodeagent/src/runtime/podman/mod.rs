@@ -69,14 +69,18 @@ pub async fn delete(path: &str) -> Result<hyper::body::Bytes, hyper::Error> {
     hyper::body::to_bytes(res).await
 }
 
-pub async fn handle_workload(command: i32, pod: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_workload(
+    command: i32,
+    pod: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     println!(
         "handle_workload called with command: {} for model(pod)",
         command
     );
     match command {
         x if x == WorkloadCommand::Start as i32 => {
-            container::start(pod).await?;
+            let container_ids = container::start(pod).await?;
+            return Ok(container_ids);
         }
         x if x == WorkloadCommand::Stop as i32 => {
             container::stop(pod).await?;
@@ -90,7 +94,7 @@ pub async fn handle_workload(command: i32, pod: &str) -> Result<(), Box<dyn std:
         }
     };
 
-    Ok(())
+    Ok(vec![])
 }
 
 //Unit tets cases
