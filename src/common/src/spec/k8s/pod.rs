@@ -35,11 +35,84 @@ pub struct PodSpec {
     pub containers: Vec<Container>,
     pub volumes: Option<Vec<Volume>>,
     initContainers: Option<Vec<Container>>,
-    restartPolicy: Option<String>,
+    /// 컨테이너 재시작 정책 (Always / OnFailure / Never)
+    pub restartPolicy: Option<String>,
     terminationGracePeriodSeconds: Option<i32>,
     hostIPC: Option<bool>,
     runtimeClassName: Option<String>,
     securityContext: Option<PodSecurityContext>,
+    /// 컨테이너 생존성 프로브 설정 (Liveness Probe)
+    #[serde(default)]
+    pub probeConfig: Option<ProbeConfig>,
+}
+
+// ── Liveness Probe 관련 구조체 ──────────────────────────────────────────────
+
+/// Pod YAML의 `probeConfig` 최상위 구조체.
+/// liveness 필드에 LivenessProbe 설정을 담습니다.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ProbeConfig {
+    /// 생존성(Liveness) 프로브 설정
+    pub liveness: Option<LivenessProbe>,
+}
+
+/// Liveness Probe 설정.
+/// HTTP / TCP / Exec 세 가지 방식 중 하나를 지정합니다.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LivenessProbe {
+    /// HTTP GET 방식 프로브
+    pub http: Option<HttpProbe>,
+    /// TCP 연결 방식 프로브
+    pub tcp: Option<TcpProbe>,
+    /// 컨테이너 내부 명령 실행 방식 프로브
+    pub exec: Option<ExecProbe>,
+    /// 컨테이너 시작 후 첫 번째 프로브까지 대기 시간(초). 기본값: 0
+    #[serde(default)]
+    pub initialDelaySeconds: u32,
+    /// 프로브 실행 간격(초). 기본값: 10
+    #[serde(default = "default_period_seconds")]
+    pub periodSeconds: u32,
+    /// 프로브 타임아웃(초). 기본값: 1
+    #[serde(default = "default_timeout_seconds")]
+    pub timeoutSeconds: u32,
+    /// 컨테이너를 비정상으로 판단하기 위한 연속 실패 횟수. 기본값: 3
+    #[serde(default = "default_failure_threshold")]
+    pub failureThreshold: u8,
+}
+
+fn default_period_seconds() -> u32 {
+    10
+}
+
+fn default_timeout_seconds() -> u32 {
+    1
+}
+
+fn default_failure_threshold() -> u8 {
+    3
+}
+
+/// HTTP GET 프로브 설정
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HttpProbe {
+    /// 요청 경로 (예: "/health")
+    pub path: String,
+    /// 대상 포트
+    pub port: u16,
+}
+
+/// TCP 연결 프로브 설정
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TcpProbe {
+    /// 대상 포트
+    pub port: u16,
+}
+
+/// Exec 프로브 설정
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExecProbe {
+    /// 컨테이너 내부에서 실행할 명령어 및 인자
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -177,6 +250,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("image-1"));
     }
@@ -194,6 +268,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), None);
     }
@@ -223,6 +298,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some(""));
     }
@@ -253,6 +329,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -286,6 +363,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &None);
     }
@@ -303,6 +381,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &Some(vec![]));
     }
@@ -326,6 +405,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -363,7 +443,138 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("special:image@tag"));
+    }
+
+    // ── probeConfig 파싱 테스트 ────────────────────────────────────────────
+
+    /// probeConfig가 없는 YAML을 파싱하면 probeConfig는 None이어야 한다.
+    #[test]
+    fn test_probe_config_none_when_absent() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-probe-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:latest
+"#;
+        let pod: super::super::Pod = serde_yaml::from_str(yaml).unwrap();
+        assert!(pod.spec.probeConfig.is_none());
+    }
+
+    /// HTTP 프로브가 포함된 YAML을 파싱하면 probeConfig가 올바르게 채워져야 한다.
+    #[test]
+    fn test_probe_config_http_parsed() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: http-probe-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:latest
+  probeConfig:
+    liveness:
+      http:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+"#;
+        let pod: super::super::Pod = serde_yaml::from_str(yaml).unwrap();
+        let probe_config = pod.spec.probeConfig.expect("probeConfig must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+        let http = liveness.http.expect("http must be Some");
+        assert_eq!(http.path, "/health");
+        assert_eq!(http.port, 8080);
+        assert_eq!(liveness.initialDelaySeconds, 5);
+        assert_eq!(liveness.periodSeconds, 10);
+        assert_eq!(liveness.timeoutSeconds, 2);
+        assert_eq!(liveness.failureThreshold, 3);
+        // TCP 및 Exec는 None이어야 한다
+        assert!(liveness.tcp.is_none());
+        assert!(liveness.exec.is_none());
+    }
+
+    /// TCP 프로브가 포함된 YAML을 파싱하면 TcpProbe가 올바르게 채워져야 한다.
+    #[test]
+    fn test_probe_config_tcp_parsed() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tcp-probe-pod
+spec:
+  containers:
+    - name: app
+      image: redis:latest
+  probeConfig:
+    liveness:
+      tcp:
+        port: 6379
+"#;
+        let pod: super::super::Pod = serde_yaml::from_str(yaml).unwrap();
+        let probe_config = pod.spec.probeConfig.expect("probeConfig must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+        let tcp = liveness.tcp.expect("tcp must be Some");
+        assert_eq!(tcp.port, 6379);
+        // 기본값 확인
+        assert_eq!(liveness.periodSeconds, 10);
+        assert_eq!(liveness.timeoutSeconds, 1);
+        assert_eq!(liveness.failureThreshold, 3);
+    }
+
+    /// Exec 프로브가 포함된 YAML을 파싱하면 ExecProbe가 올바르게 채워져야 한다.
+    #[test]
+    fn test_probe_config_exec_parsed() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exec-probe-pod
+spec:
+  containers:
+    - name: app
+      image: busybox:latest
+  probeConfig:
+    liveness:
+      exec:
+        command:
+          - cat
+          - /tmp/healthy
+      failureThreshold: 5
+"#;
+        let pod: super::super::Pod = serde_yaml::from_str(yaml).unwrap();
+        let probe_config = pod.spec.probeConfig.expect("probeConfig must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+        let exec = liveness.exec.expect("exec must be Some");
+        assert_eq!(exec.command, vec!["cat", "/tmp/healthy"]);
+        assert_eq!(liveness.failureThreshold, 5);
+    }
+
+    /// restartPolicy 필드가 YAML에서 올바르게 파싱되어야 한다.
+    #[test]
+    fn test_restart_policy_parsed() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restart-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:latest
+  restartPolicy: OnFailure
+"#;
+        let pod: super::super::Pod = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(pod.spec.restartPolicy.as_deref(), Some("OnFailure"));
     }
 }

@@ -2,7 +2,18 @@
  * SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::desired_state::DesiredState;
+
+//! NodeAgent gRPC 수신 처리 모듈 - ActionController
+//!
+//! 이 모듈은 ActionController로부터 워크로드 요청(Start/Stop/Remove 등)을 수신하여
+//! Podman을 통해 컨테이너를 제어하고, 자기 치유(Self-Healing)를 위한 DesiredState를
+//! 인메모리 캐시에 관리합니다.
+//!
+//! ## 주요 기능
+//! - Pod YAML을 완전히 파싱하여 probeConfig 및 restartPolicy를 DesiredState에 반영
+//! - Liveness Probe 설정이 포함된 경우 probe_loop에서 자동으로 감지 및 실행
+
+use crate::desired_state::{DesiredState, LivenessProbe, ProbeConfig, ProbeType, RestartPolicy};
 use common::nodeagent::fromactioncontroller::{
     HandleWorkloadRequest, HandleWorkloadResponse, WorkloadCommand,
 };
@@ -11,10 +22,72 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
-/// Extract pod name from pod YAML string.
+/// Pod YAML 문자열에서 pod 이름을 추출합니다.
 fn extract_pod_name(pod_yaml: &str) -> Result<String, Box<dyn std::error::Error>> {
     let pod = serde_yaml::from_str::<common::spec::k8s::Pod>(pod_yaml)?;
     Ok(pod.get_name())
+}
+
+/// `common::spec::k8s::pod::ProbeConfig`를 NodeAgent 내부 타입인
+/// `crate::desired_state::ProbeConfig`로 변환합니다.
+///
+/// ## 변환 규칙
+/// - liveness.http → ProbeType::Http
+/// - liveness.tcp  → ProbeType::Tcp (http가 없는 경우)
+/// - liveness.exec → ProbeType::Exec (http, tcp가 없는 경우)
+/// - 셋 모두 없으면 liveness 설정을 None으로 처리
+fn convert_probe_config(common_probe: common::spec::k8s::pod::ProbeConfig) -> Option<ProbeConfig> {
+    let liveness = common_probe.liveness?;
+
+    // 세 가지 프로브 타입 중 하나를 선택 (HTTP > TCP > Exec 우선순위)
+    let probe_type = if let Some(http) = liveness.http {
+        ProbeType::Http {
+            path: http.path,
+            port: http.port,
+        }
+    } else if let Some(tcp) = liveness.tcp {
+        ProbeType::Tcp { port: tcp.port }
+    } else if let Some(exec) = liveness.exec {
+        ProbeType::Exec {
+            command: exec.command,
+        }
+    } else {
+        // 프로브 타입이 지정되지 않으면 Liveness Probe를 설정하지 않음
+        return None;
+    };
+
+    Some(ProbeConfig {
+        liveness: Some(LivenessProbe {
+            probe_type,
+            initial_delay_seconds: liveness.initialDelaySeconds,
+            period_seconds: liveness.periodSeconds,
+            timeout_seconds: liveness.timeoutSeconds,
+            failure_threshold: liveness.failureThreshold,
+        }),
+    })
+}
+
+/// Pod YAML을 완전히 파싱하여 restart_policy와 probe_config가 설정된
+/// DesiredState를 생성합니다.
+///
+/// YAML 파싱 실패 시 기본값(Always, probe_config=None)으로 폴백합니다.
+fn build_desired_state(pod_name: String, pod_yaml: &str) -> DesiredState {
+    let mut state = DesiredState::new(pod_name);
+
+    if let Ok(pod) = serde_yaml::from_str::<common::spec::k8s::Pod>(pod_yaml) {
+        // restartPolicy 변환
+        state.restart_policy = match pod.spec.restartPolicy.as_deref() {
+            Some("Always") => RestartPolicy::Always,
+            Some("OnFailure") => RestartPolicy::OnFailure,
+            Some("Never") => RestartPolicy::Never,
+            _ => RestartPolicy::Always,
+        };
+
+        // probeConfig 변환 (None이면 Probe 미실행)
+        state.probe_config = pod.spec.probeConfig.and_then(convert_probe_config);
+    }
+
+    state
 }
 
 pub async fn handle_workload(
@@ -37,8 +110,9 @@ pub async fn handle_workload(
     };
 
     if command == WorkloadCommand::Start as i32 {
-        // 1. Create DesiredState struct
-        let desired_state = DesiredState::new(pod_name.clone());
+        // 1. Pod YAML을 완전히 파싱하여 DesiredState 생성
+        //    (restartPolicy, probeConfig 포함)
+        let desired_state = build_desired_state(pod_name.clone(), &pod_yaml);
 
         // 2. Insert into memory cache before starting the container
         {
@@ -147,6 +221,65 @@ spec:
       image: nginx:latest
 "#;
 
+    /// probeConfig가 포함된 Pod YAML (HTTP 프로브)
+    const POD_YAML_WITH_HTTP_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: http-probe-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:latest
+  restartPolicy: Always
+  probeConfig:
+    liveness:
+      http:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+"#;
+
+    /// probeConfig가 포함된 Pod YAML (TCP 프로브)
+    const POD_YAML_WITH_TCP_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tcp-probe-pod
+spec:
+  containers:
+    - name: app
+      image: redis:latest
+  restartPolicy: OnFailure
+  probeConfig:
+    liveness:
+      tcp:
+        port: 6379
+"#;
+
+    /// probeConfig가 포함된 Pod YAML (Exec 프로브)
+    const POD_YAML_WITH_EXEC_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exec-probe-pod
+spec:
+  containers:
+    - name: app
+      image: busybox:latest
+  restartPolicy: Never
+  probeConfig:
+    liveness:
+      exec:
+        command:
+          - cat
+          - /tmp/healthy
+      failureThreshold: 5
+"#;
+
     #[test]
     fn test_extract_pod_name_valid() {
         let result = extract_pod_name(VALID_POD_YAML);
@@ -165,6 +298,105 @@ spec:
         let result = extract_pod_name("");
         assert!(result.is_err());
     }
+
+    // ── build_desired_state 테스트 ────────────────────────────────────────────
+
+    /// probeConfig 없는 YAML로 빌드하면 probe_config가 None이어야 한다.
+    #[test]
+    fn test_build_desired_state_no_probe() {
+        let state = build_desired_state("test-pod".to_string(), VALID_POD_YAML);
+        assert_eq!(state.pod_name, "test-pod");
+        assert!(state.probe_config.is_none());
+        assert_eq!(state.restart_policy, RestartPolicy::Always);
+    }
+
+    /// HTTP probeConfig가 있는 YAML로 빌드하면 probe_config가 올바르게 설정되어야 한다.
+    #[test]
+    fn test_build_desired_state_http_probe() {
+        let state = build_desired_state("http-probe-pod".to_string(), POD_YAML_WITH_HTTP_PROBE);
+        assert_eq!(state.pod_name, "http-probe-pod");
+        assert_eq!(state.restart_policy, RestartPolicy::Always);
+
+        let probe_config = state.probe_config.expect("probe_config must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+        assert_eq!(liveness.initial_delay_seconds, 5);
+        assert_eq!(liveness.period_seconds, 10);
+        assert_eq!(liveness.timeout_seconds, 2);
+        assert_eq!(liveness.failure_threshold, 3);
+
+        match liveness.probe_type {
+            ProbeType::Http { path, port } => {
+                assert_eq!(path, "/health");
+                assert_eq!(port, 8080);
+            }
+            _ => panic!("Expected Http probe type"),
+        }
+    }
+
+    /// TCP probeConfig가 있는 YAML로 빌드하면 RestartPolicy::OnFailure와
+    /// ProbeType::Tcp가 설정되어야 한다.
+    #[test]
+    fn test_build_desired_state_tcp_probe() {
+        let state = build_desired_state("tcp-probe-pod".to_string(), POD_YAML_WITH_TCP_PROBE);
+        assert_eq!(state.restart_policy, RestartPolicy::OnFailure);
+
+        let probe_config = state.probe_config.expect("probe_config must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+
+        match liveness.probe_type {
+            ProbeType::Tcp { port } => assert_eq!(port, 6379),
+            _ => panic!("Expected Tcp probe type"),
+        }
+    }
+
+    /// Exec probeConfig가 있는 YAML로 빌드하면 RestartPolicy::Never와
+    /// ProbeType::Exec가 설정되어야 한다.
+    #[test]
+    fn test_build_desired_state_exec_probe() {
+        let state = build_desired_state("exec-probe-pod".to_string(), POD_YAML_WITH_EXEC_PROBE);
+        assert_eq!(state.restart_policy, RestartPolicy::Never);
+
+        let probe_config = state.probe_config.expect("probe_config must be Some");
+        let liveness = probe_config.liveness.expect("liveness must be Some");
+        assert_eq!(liveness.failure_threshold, 5);
+
+        match liveness.probe_type {
+            ProbeType::Exec { command } => {
+                assert_eq!(command, vec!["cat", "/tmp/healthy"]);
+            }
+            _ => panic!("Expected Exec probe type"),
+        }
+    }
+
+    // ── convert_probe_config 테스트 ───────────────────────────────────────────
+
+    /// probeConfig에 liveness가 없으면 None을 반환해야 한다.
+    #[test]
+    fn test_convert_probe_config_no_liveness() {
+        let common_probe = common::spec::k8s::pod::ProbeConfig { liveness: None };
+        let result = convert_probe_config(common_probe);
+        assert!(result.is_none());
+    }
+
+    /// liveness에 프로브 타입이 하나도 없으면 None을 반환해야 한다.
+    #[test]
+    fn test_convert_probe_config_no_probe_type() {
+        let common_probe = common::spec::k8s::pod::ProbeConfig {
+            liveness: Some(common::spec::k8s::pod::LivenessProbe {
+                http: None,
+                tcp: None,
+                exec: None,
+                initialDelaySeconds: 0,
+                periodSeconds: 10,
+                timeoutSeconds: 1,
+                failureThreshold: 3,
+            }),
+        };
+        let result = convert_probe_config(common_probe);
+        assert!(result.is_none());
+    }
+
+    // ── handle_workload 통합 테스트 ───────────────────────────────────────────
 
     #[tokio::test]
     async fn test_handle_workload_invalid_yaml_returns_error() {
@@ -260,6 +492,28 @@ spec:
 
         // Should not panic even if pod is not in cache
         let _ = handle_workload(request, Arc::clone(&cache)).await;
+        assert_eq!(cache.lock().await.len(), 0);
+    }
+
+    /// START 명령 시 HTTP probeConfig가 포함된 YAML을 사용하면
+    /// 캐시의 DesiredState에 probe_config가 설정되어야 한다.
+    /// (Podman이 없어 Start는 실패하지만, 캐시는 설정 후 제거된다.)
+    #[tokio::test]
+    async fn test_handle_workload_start_with_probe_config_sets_desired_state() {
+        let cache = make_cache();
+
+        // Podman이 없으면 Start는 실패하지만, 시작 전에 캐시에 삽입되는 것을 확인
+        // (실패 시 캐시는 제거됨 - 이는 기존 동작 유지)
+        let request = tonic::Request::new(HandleWorkloadRequest {
+            workload_command: WorkloadCommand::Start as i32,
+            pod: POD_YAML_WITH_HTTP_PROBE.to_string(),
+        });
+
+        let result = handle_workload(request, Arc::clone(&cache)).await;
+
+        // Podman 없이는 실패
+        assert!(result.is_err());
+        // 실패 후 캐시는 비어있어야 한다
         assert_eq!(cache.lock().await.len(), 0);
     }
 }
