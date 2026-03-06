@@ -16,7 +16,6 @@ pub mod config;
 pub mod desired_state;
 pub mod grpc;
 pub mod manager;
-pub mod probe;
 pub mod resource;
 pub mod runtime;
 
