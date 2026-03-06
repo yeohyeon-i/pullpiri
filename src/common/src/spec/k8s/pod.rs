@@ -35,11 +35,49 @@ pub struct PodSpec {
     pub containers: Vec<Container>,
     pub volumes: Option<Vec<Volume>>,
     initContainers: Option<Vec<Container>>,
-    restartPolicy: Option<String>,
+    pub restartPolicy: Option<String>,
     terminationGracePeriodSeconds: Option<i32>,
     hostIPC: Option<bool>,
     runtimeClassName: Option<String>,
     securityContext: Option<PodSecurityContext>,
+    pub probeConfig: Option<ProbeConfig>,
+}
+
+/// Top-level probe configuration attached to a Pod specification.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ProbeConfig {
+    pub liveness: Option<LivenessProbe>,
+}
+
+/// Liveness probe configuration mirroring the Kubernetes liveness probe spec.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LivenessProbe {
+    pub http: Option<HttpProbe>,
+    pub tcp: Option<TcpProbe>,
+    pub exec: Option<ExecProbe>,
+    pub initialDelaySeconds: u32,
+    pub periodSeconds: u32,
+    pub timeoutSeconds: u32,
+    pub failureThreshold: u8,
+}
+
+/// HTTP GET probe parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HttpProbe {
+    pub path: String,
+    pub port: u16,
+}
+
+/// TCP socket probe parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TcpProbe {
+    pub port: u16,
+}
+
+/// Exec probe parameters (command run inside the container).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExecProbe {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -177,6 +215,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("image-1"));
     }
@@ -194,6 +233,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), None);
     }
@@ -223,6 +263,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some(""));
     }
@@ -253,6 +294,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -286,6 +328,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &None);
     }
@@ -303,6 +346,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &Some(vec![]));
     }
@@ -326,6 +370,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -363,7 +408,103 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("special:image@tag"));
+    }
+
+    // Positive Test: Validate that a Pod YAML with probeConfig can be deserialized correctly.
+    #[test]
+    fn test_podspec_deserialize_with_probe_config() {
+        let yaml = r#"
+containers:
+  - name: nginx
+    image: nginx:latest
+probeConfig:
+  liveness:
+    http:
+      path: /healthz
+      port: 80
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+"#;
+        let spec: PodSpec = serde_yaml::from_str(yaml).expect("deserialization failed");
+        let probe_config = spec.probeConfig.expect("probeConfig should be present");
+        let liveness = probe_config.liveness.expect("liveness should be present");
+        assert_eq!(liveness.initialDelaySeconds, 5);
+        assert_eq!(liveness.periodSeconds, 10);
+        assert_eq!(liveness.timeoutSeconds, 3);
+        assert_eq!(liveness.failureThreshold, 3);
+        let http = liveness.http.expect("http probe should be present");
+        assert_eq!(http.path, "/healthz");
+        assert_eq!(http.port, 80);
+        assert!(liveness.tcp.is_none());
+        assert!(liveness.exec.is_none());
+    }
+
+    // Positive Test: Validate that a Pod YAML with TCP probe config deserializes correctly.
+    #[test]
+    fn test_podspec_deserialize_with_tcp_probe_config() {
+        let yaml = r#"
+containers:
+  - name: redis
+    image: redis:latest
+probeConfig:
+  liveness:
+    tcp:
+      port: 6379
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+"#;
+        let spec: PodSpec = serde_yaml::from_str(yaml).expect("deserialization failed");
+        let probe_config = spec.probeConfig.expect("probeConfig should be present");
+        let liveness = probe_config.liveness.expect("liveness should be present");
+        let tcp = liveness.tcp.expect("tcp probe should be present");
+        assert_eq!(tcp.port, 6379);
+        assert!(liveness.http.is_none());
+        assert!(liveness.exec.is_none());
+    }
+
+    // Positive Test: Validate that a Pod YAML with Exec probe config deserializes correctly.
+    #[test]
+    fn test_podspec_deserialize_with_exec_probe_config() {
+        let yaml = r#"
+containers:
+  - name: myapp
+    image: myapp:latest
+probeConfig:
+  liveness:
+    exec:
+      command:
+        - cat
+        - /tmp/healthy
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+"#;
+        let spec: PodSpec = serde_yaml::from_str(yaml).expect("deserialization failed");
+        let probe_config = spec.probeConfig.expect("probeConfig should be present");
+        let liveness = probe_config.liveness.expect("liveness should be present");
+        let exec = liveness.exec.expect("exec probe should be present");
+        assert_eq!(exec.command, vec!["cat", "/tmp/healthy"]);
+        assert!(liveness.http.is_none());
+        assert!(liveness.tcp.is_none());
+    }
+
+    // Negative Test: Validate that a Pod YAML without probeConfig results in None.
+    #[test]
+    fn test_podspec_deserialize_without_probe_config() {
+        let yaml = r#"
+containers:
+  - name: nginx
+    image: nginx:latest
+"#;
+        let spec: PodSpec = serde_yaml::from_str(yaml).expect("deserialization failed");
+        assert!(spec.probeConfig.is_none());
     }
 }

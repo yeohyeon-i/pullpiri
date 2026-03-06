@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright 2024 LG Electronics Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::desired_state::DesiredState;
+use crate::desired_state::{DesiredState, LivenessProbe, ProbeConfig, ProbeType, RestartPolicy};
 use common::nodeagent::fromactioncontroller::{
     HandleWorkloadRequest, HandleWorkloadResponse, WorkloadCommand,
 };
@@ -15,6 +15,70 @@ use tonic::{Request, Response, Status};
 fn extract_pod_name(pod_yaml: &str) -> Result<String, Box<dyn std::error::Error>> {
     let pod = serde_yaml::from_str::<common::spec::k8s::Pod>(pod_yaml)?;
     Ok(pod.get_name())
+}
+
+/// Build a [`DesiredState`] from a fully-parsed Pod YAML string.
+///
+/// Parses the restart policy and probe configuration from the YAML so that the
+/// liveness probe loop and reconciliation loop have all the information they need.
+fn build_desired_state(
+    pod_name: String,
+    pod_yaml: &str,
+) -> Result<DesiredState, Box<dyn std::error::Error>> {
+    let pod = serde_yaml::from_str::<common::spec::k8s::Pod>(pod_yaml)?;
+
+    let restart_policy = match pod.spec.restartPolicy.as_deref() {
+        Some("Always") | None => RestartPolicy::Always,
+        Some("OnFailure") => RestartPolicy::OnFailure,
+        Some("Never") => RestartPolicy::Never,
+        Some(_) => RestartPolicy::Always,
+    };
+
+    let probe_config = pod.spec.probeConfig.map(convert_probe_config);
+
+    let mut desired_state = DesiredState::new(pod_name);
+    desired_state.restart_policy = restart_policy;
+    desired_state.probe_config = probe_config;
+    Ok(desired_state)
+}
+
+/// Convert a [`common::spec::k8s::pod::ProbeConfig`] into the nodeagent-internal
+/// [`ProbeConfig`] type.
+fn convert_probe_config(common_probe: common::spec::k8s::pod::ProbeConfig) -> ProbeConfig {
+    ProbeConfig {
+        liveness: common_probe.liveness.map(convert_liveness_probe),
+    }
+}
+
+/// Convert a [`common::spec::k8s::pod::LivenessProbe`] into the nodeagent-internal
+/// [`LivenessProbe`] type, choosing the first configured probe type.
+fn convert_liveness_probe(lp: common::spec::k8s::pod::LivenessProbe) -> LivenessProbe {
+    let probe_type = if let Some(http) = lp.http {
+        ProbeType::Http {
+            path: http.path,
+            port: http.port,
+        }
+    } else if let Some(tcp) = lp.tcp {
+        ProbeType::Tcp { port: tcp.port }
+    } else if let Some(exec) = lp.exec {
+        ProbeType::Exec {
+            command: exec.command,
+        }
+    } else {
+        // Default to an HTTP probe on port 80 if no type is specified.
+        ProbeType::Http {
+            path: "/".to_string(),
+            port: 80,
+        }
+    };
+
+    LivenessProbe {
+        probe_type,
+        initial_delay_seconds: lp.initialDelaySeconds,
+        period_seconds: lp.periodSeconds,
+        timeout_seconds: lp.timeoutSeconds,
+        failure_threshold: lp.failureThreshold,
+    }
 }
 
 pub async fn handle_workload(
@@ -37,8 +101,16 @@ pub async fn handle_workload(
     };
 
     if command == WorkloadCommand::Start as i32 {
-        // 1. Create DesiredState struct
-        let desired_state = DesiredState::new(pod_name.clone());
+        // 1. Build DesiredState from the full pod YAML (includes probe_config and restart_policy)
+        let desired_state = match build_desired_state(pod_name.clone(), &pod_yaml) {
+            Ok(state) => state,
+            Err(e) => {
+                return Err(Status::invalid_argument(format!(
+                    "Failed to build desired state: {}",
+                    e
+                )));
+            }
+        };
 
         // 2. Insert into memory cache before starting the container
         {
@@ -147,6 +219,90 @@ spec:
       image: nginx:latest
 "#;
 
+    const POD_YAML_WITH_HTTP_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-pod
+spec:
+  containers:
+    - name: nginx
+      image: nginx:latest
+  probeConfig:
+    liveness:
+      http:
+        path: /healthz
+        port: 80
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+"#;
+
+    const POD_YAML_WITH_TCP_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tcp-probe-pod
+spec:
+  containers:
+    - name: redis
+      image: redis:latest
+  probeConfig:
+    liveness:
+      tcp:
+        port: 6379
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 3
+"#;
+
+    const POD_YAML_WITH_EXEC_PROBE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exec-probe-pod
+spec:
+  containers:
+    - name: myapp
+      image: myapp:latest
+  probeConfig:
+    liveness:
+      exec:
+        command:
+          - cat
+          - /tmp/healthy
+      initialDelaySeconds: 0
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 3
+"#;
+
+    const POD_YAML_WITH_RESTART_NEVER: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: never-restart-pod
+spec:
+  containers:
+    - name: job
+      image: busybox:latest
+  restartPolicy: Never
+"#;
+
+    const POD_YAML_WITH_RESTART_ON_FAILURE: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: on-failure-pod
+spec:
+  containers:
+    - name: app
+      image: app:latest
+  restartPolicy: OnFailure
+"#;
+
     #[test]
     fn test_extract_pod_name_valid() {
         let result = extract_pod_name(VALID_POD_YAML);
@@ -165,6 +321,87 @@ spec:
         let result = extract_pod_name("");
         assert!(result.is_err());
     }
+
+    // ── build_desired_state ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_desired_state_no_probe_config() {
+        let state = build_desired_state("test-pod".to_string(), VALID_POD_YAML).unwrap();
+        assert_eq!(state.pod_name, "test-pod");
+        assert!(state.probe_config.is_none());
+        assert_eq!(state.restart_policy, RestartPolicy::Always);
+    }
+
+    #[test]
+    fn test_build_desired_state_http_probe() {
+        let state = build_desired_state("probe-pod".to_string(), POD_YAML_WITH_HTTP_PROBE).unwrap();
+        assert_eq!(state.pod_name, "probe-pod");
+        let pc = state.probe_config.expect("probe_config should be Some");
+        let liveness = pc.liveness.expect("liveness should be Some");
+        assert_eq!(liveness.initial_delay_seconds, 5);
+        assert_eq!(liveness.period_seconds, 10);
+        assert_eq!(liveness.timeout_seconds, 3);
+        assert_eq!(liveness.failure_threshold, 3);
+        if let ProbeType::Http { path, port } = liveness.probe_type {
+            assert_eq!(path, "/healthz");
+            assert_eq!(port, 80);
+        } else {
+            panic!("Expected Http probe type");
+        }
+    }
+
+    #[test]
+    fn test_build_desired_state_tcp_probe() {
+        let state =
+            build_desired_state("tcp-probe-pod".to_string(), POD_YAML_WITH_TCP_PROBE).unwrap();
+        let pc = state.probe_config.expect("probe_config should be Some");
+        let liveness = pc.liveness.expect("liveness should be Some");
+        if let ProbeType::Tcp { port } = liveness.probe_type {
+            assert_eq!(port, 6379);
+        } else {
+            panic!("Expected Tcp probe type");
+        }
+    }
+
+    #[test]
+    fn test_build_desired_state_exec_probe() {
+        let state =
+            build_desired_state("exec-probe-pod".to_string(), POD_YAML_WITH_EXEC_PROBE).unwrap();
+        let pc = state.probe_config.expect("probe_config should be Some");
+        let liveness = pc.liveness.expect("liveness should be Some");
+        if let ProbeType::Exec { command } = liveness.probe_type {
+            assert_eq!(command, vec!["cat", "/tmp/healthy"]);
+        } else {
+            panic!("Expected Exec probe type");
+        }
+    }
+
+    #[test]
+    fn test_build_desired_state_restart_never() {
+        let state =
+            build_desired_state("never-restart-pod".to_string(), POD_YAML_WITH_RESTART_NEVER)
+                .unwrap();
+        assert_eq!(state.restart_policy, RestartPolicy::Never);
+    }
+
+    #[test]
+    fn test_build_desired_state_restart_on_failure() {
+        let state = build_desired_state(
+            "on-failure-pod".to_string(),
+            POD_YAML_WITH_RESTART_ON_FAILURE,
+        )
+        .unwrap();
+        assert_eq!(state.restart_policy, RestartPolicy::OnFailure);
+    }
+
+    #[test]
+    fn test_build_desired_state_default_restart_is_always() {
+        // VALID_POD_YAML has no restartPolicy field → should default to Always
+        let state = build_desired_state("test-pod".to_string(), VALID_POD_YAML).unwrap();
+        assert_eq!(state.restart_policy, RestartPolicy::Always);
+    }
+
+    // ── handle_workload (integration-style, without Podman) ───────────────────
 
     #[tokio::test]
     async fn test_handle_workload_invalid_yaml_returns_error() {
