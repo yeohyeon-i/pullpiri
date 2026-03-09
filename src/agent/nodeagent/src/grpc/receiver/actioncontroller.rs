@@ -90,6 +90,10 @@ pub async fn handle_workload(
         // Parse probe config from pod spec
         desired_state.probe_config = pod.get_probe_config().and_then(convert_probe_config);
 
+        // Store the pod YAML so the reconciliation loop can recreate the container
+        // if it is completely removed from Podman.
+        desired_state.pod_yaml = pod_yaml.clone();
+
         // Insert into memory cache before starting the container
         {
             let mut cache = desired_states_cache.lock().await;

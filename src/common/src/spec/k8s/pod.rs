@@ -59,6 +59,16 @@ pub struct ProbeConfig {
     pub liveness: Option<LivenessProbeSpec>,
 }
 
+fn default_period_seconds() -> u32 {
+    10
+}
+fn default_timeout_seconds() -> u32 {
+    1
+}
+fn default_failure_threshold() -> u8 {
+    3
+}
+
 /// Liveness probe configuration as specified in Pod YAML.
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -66,9 +76,17 @@ pub struct LivenessProbeSpec {
     pub http: Option<HttpProbeSpec>,
     pub tcp: Option<TcpProbeSpec>,
     pub exec: Option<ExecProbeSpec>,
+    /// Seconds to wait before the first probe after container start (default: 0).
+    #[serde(default)]
     pub initialDelaySeconds: u32,
+    /// How often (in seconds) to probe (default: 10).
+    #[serde(default = "default_period_seconds")]
     pub periodSeconds: u32,
+    /// Seconds after which each probe attempt times out (default: 1).
+    #[serde(default = "default_timeout_seconds")]
     pub timeoutSeconds: u32,
+    /// Minimum consecutive failures to mark the container as unhealthy (default: 3).
+    #[serde(default = "default_failure_threshold")]
     pub failureThreshold: u8,
 }
 
@@ -422,5 +440,68 @@ mod tests {
             probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("special:image@tag"));
+    }
+
+    // Test: probeConfig with all timing fields omitted uses sensible defaults.
+    #[test]
+    fn test_liveness_probe_spec_defaults_when_fields_omitted() {
+        let yaml = r#"
+http:
+  path: /healthz
+  port: 8080
+"#;
+        let spec: LivenessProbeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.initialDelaySeconds, 0);
+        assert_eq!(spec.periodSeconds, 10);
+        assert_eq!(spec.timeoutSeconds, 1);
+        assert_eq!(spec.failureThreshold, 3);
+        assert!(spec.http.is_some());
+    }
+
+    // Test: probeConfig with explicit values overrides defaults.
+    #[test]
+    fn test_liveness_probe_spec_explicit_values_override_defaults() {
+        let yaml = r#"
+http:
+  path: /ready
+  port: 9090
+initialDelaySeconds: 15
+periodSeconds: 30
+timeoutSeconds: 5
+failureThreshold: 5
+"#;
+        let spec: LivenessProbeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.initialDelaySeconds, 15);
+        assert_eq!(spec.periodSeconds, 30);
+        assert_eq!(spec.timeoutSeconds, 5);
+        assert_eq!(spec.failureThreshold, 5);
+    }
+
+    // Test: full Pod YAML with probeConfig using only minimal fields parses correctly.
+    #[test]
+    fn test_pod_yaml_with_partial_probe_config_uses_defaults() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: partial-probe-pod
+spec:
+  containers:
+    - name: app
+      image: myapp:latest
+  probeConfig:
+    liveness:
+      tcp:
+        port: 8080
+"#;
+        let pod = serde_yaml::from_str::<crate::spec::k8s::Pod>(yaml).unwrap();
+        let probe_config = pod.get_probe_config().unwrap();
+        let liveness = probe_config.liveness.as_ref().unwrap();
+        assert_eq!(liveness.initialDelaySeconds, 0);
+        assert_eq!(liveness.periodSeconds, 10);
+        assert_eq!(liveness.timeoutSeconds, 1);
+        assert_eq!(liveness.failureThreshold, 3);
+        assert!(liveness.tcp.is_some());
+        assert_eq!(liveness.tcp.as_ref().unwrap().port, 8080);
     }
 }
