@@ -21,6 +21,16 @@ impl Pod {
     pub fn get_name(&self) -> String {
         self.metadata.name.clone()
     }
+
+    /// Returns the restart policy of the pod spec, if set.
+    pub fn get_restart_policy(&self) -> Option<&str> {
+        self.spec.restartPolicy.as_deref()
+    }
+
+    /// Returns the probe configuration of the pod spec, if set.
+    pub fn get_probe_config(&self) -> Option<&ProbeConfig> {
+        self.spec.probeConfig.as_ref()
+    }
 }
 
 impl From<Model> for Pod {
@@ -40,6 +50,45 @@ pub struct PodSpec {
     hostIPC: Option<bool>,
     runtimeClassName: Option<String>,
     securityContext: Option<PodSecurityContext>,
+    pub probeConfig: Option<ProbeConfig>,
+}
+
+/// Configuration for health probes in the Pod YAML spec.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ProbeConfig {
+    pub liveness: Option<LivenessProbeSpec>,
+}
+
+/// Liveness probe configuration as specified in Pod YAML.
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LivenessProbeSpec {
+    pub http: Option<HttpProbeSpec>,
+    pub tcp: Option<TcpProbeSpec>,
+    pub exec: Option<ExecProbeSpec>,
+    pub initialDelaySeconds: u32,
+    pub periodSeconds: u32,
+    pub timeoutSeconds: u32,
+    pub failureThreshold: u8,
+}
+
+/// HTTP GET probe configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HttpProbeSpec {
+    pub path: String,
+    pub port: u16,
+}
+
+/// TCP socket probe configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TcpProbeSpec {
+    pub port: u16,
+}
+
+/// Command execution probe configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExecProbeSpec {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -177,6 +226,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("image-1"));
     }
@@ -194,6 +244,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), None);
     }
@@ -223,6 +274,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some(""));
     }
@@ -253,6 +305,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -286,6 +339,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &None);
     }
@@ -303,6 +357,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_volume(), &Some(vec![]));
     }
@@ -326,6 +381,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(
             podspec.get_volume(),
@@ -363,6 +419,7 @@ mod tests {
             hostIPC: None,
             runtimeClassName: None,
             securityContext: None,
+            probeConfig: None,
         };
         assert_eq!(podspec.get_image(), Some("special:image@tag"));
     }

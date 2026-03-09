@@ -220,11 +220,18 @@ impl NodeAgentManager {
             reconciliation_loop(reconcile_cache).await;
         });
 
+        // Spawn the liveness probe loop to monitor running containers
+        let probe_cache = Arc::clone(&arc_self.desired_states_cache);
+        let probe_task = tokio::spawn(async move {
+            crate::probe::probe_loop(probe_cache).await;
+        });
+
         let _ = tokio::try_join!(
             grpc_processor,
             container_gatherer,
             nodeinfo_task,
-            reconciler
+            reconciler,
+            probe_task
         );
         println!("NodeAgentManager stopped");
         Ok(())
