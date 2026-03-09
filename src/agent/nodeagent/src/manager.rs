@@ -291,7 +291,7 @@ pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String,
                     if let Some(new_id) = handle_missing_container(desired).await {
                         let mut cache = desired_states_cache.lock().await;
                         if let Some(state) = cache.get_mut(pod_name) {
-                            println!(
+                            eprintln!(
                                 "[Reconciliation] Updating container_id for pod '{}': {} → {}",
                                 pod_name, state.container_id, new_id
                             );
@@ -348,7 +348,7 @@ async fn handle_missing_container(desired: &DesiredState) -> Option<String> {
         RestartPolicy::Never => false,
     };
 
-    println!(
+    eprintln!(
         "[Reconciliation] Pod '{}': container '{}' missing, policy={:?}, restart={}",
         desired.pod_name, desired.container_id, desired.restart_policy, should_restart
     );
@@ -369,7 +369,7 @@ async fn handle_missing_container(desired: &DesiredState) -> Option<String> {
         Ok(ids) => {
             let new_id = ids.into_iter().next();
             if let Some(ref id) = new_id {
-                println!(
+                eprintln!(
                     "[Reconciliation] Pod '{}': recreated container with new ID '{}'",
                     desired.pod_name, id
                 );
@@ -405,7 +405,7 @@ async fn handle_exited_container(desired: &DesiredState, exit_code: i32) {
         RestartPolicy::Never => false,
     };
 
-    println!(
+    eprintln!(
         "[Reconciliation] Pod '{}': container '{}' exited (code {}), policy={:?}, restart={}",
         desired.pod_name, desired.container_id, exit_code, desired.restart_policy, should_restart
     );
@@ -413,7 +413,7 @@ async fn handle_exited_container(desired: &DesiredState, exit_code: i32) {
     if should_restart {
         let restart_path = format!("/v4.0.0/libpod/containers/{}/restart", desired.container_id);
         match crate::runtime::podman::post(&restart_path, Body::empty()).await {
-            Ok(_) => println!(
+            Ok(_) => eprintln!(
                 "[Reconciliation] Container '{}' restarted successfully",
                 desired.container_id
             ),

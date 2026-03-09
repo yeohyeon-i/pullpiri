@@ -59,12 +59,16 @@ pub struct ProbeConfig {
     pub liveness: Option<LivenessProbeSpec>,
 }
 
+/// Default probe period: 10 seconds (aligns with Kubernetes convention).
 fn default_period_seconds() -> u32 {
     10
 }
+/// Default probe timeout: 1 second (suitable for fast local health-check endpoints).
 fn default_timeout_seconds() -> u32 {
     1
 }
+/// Default failure threshold: 3 consecutive failures before marking unhealthy
+/// (aligns with Kubernetes convention and provides a small buffer against transient failures).
 fn default_failure_threshold() -> u8 {
     3
 }
