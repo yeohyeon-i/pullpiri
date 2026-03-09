@@ -7,5 +7,5 @@ pub struct Pod {
     apiVersion: String,
     kind: String,
     metadata: super::MetaData,
-    spec: pod::PodSpec,
+    pub spec: pod::PodSpec,
 }
