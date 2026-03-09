@@ -27,6 +27,7 @@ pub struct DesiredState {
     pub pod_name: String,
     /// Podman container ID, set after the container is successfully started.
     /// Used for Podman API calls (inspect, restart, stop, etc.).
+    /// Updated when a missing container is recreated with a new ID.
     pub container_id: String,
     /// Restart policy that determines self-healing behavior when the container exits.
     pub restart_policy: RestartPolicy,
@@ -34,6 +35,10 @@ pub struct DesiredState {
     pub probe_config: Option<ProbeConfig>,
     /// Timestamp when the desired state was first created (for debugging/logging).
     pub created_at: SystemTime,
+    /// The original Pod YAML used to start this container.
+    /// Stored so the reconciliation loop can recreate the container if it is
+    /// completely removed from Podman (missing, not just exited).
+    pub pod_yaml: String,
 }
 
 impl DesiredState {
@@ -48,6 +53,7 @@ impl DesiredState {
             restart_policy: RestartPolicy::Always,
             probe_config: None,
             created_at: SystemTime::now(),
+            pod_yaml: String::new(),
         }
     }
 }
@@ -108,6 +114,7 @@ mod tests {
         assert_eq!(state.container_id, "");
         assert_eq!(state.restart_policy, RestartPolicy::Always);
         assert!(state.probe_config.is_none());
+        assert_eq!(state.pod_yaml, "");
     }
 
     #[test]
@@ -204,5 +211,17 @@ mod tests {
         assert!(json.is_ok());
         let json_str = json.unwrap();
         assert!(json_str.contains("serial-pod"));
+    }
+
+    #[test]
+    fn test_desired_state_with_pod_yaml() {
+        let mut state = DesiredState::new("yaml-pod".to_string());
+        let yaml = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: yaml-pod\nspec:\n  containers:\n  - name: c\n    image: nginx\n";
+        state.pod_yaml = yaml.to_string();
+
+        assert_eq!(state.pod_yaml, yaml);
+        // Ensure pod_yaml survives a clone
+        let cloned = state.clone();
+        assert_eq!(cloned.pod_yaml, yaml);
     }
 }

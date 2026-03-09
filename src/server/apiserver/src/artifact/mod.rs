@@ -210,7 +210,7 @@ async fn load_model_with_resources(
 
         if let Some(volume_spec) = volume.get_spec() {
             model
-                .get_podspec()
+                .get_podspec_mut()
                 .volumes
                 .clone_from(volume_spec.get_volume());
         }
