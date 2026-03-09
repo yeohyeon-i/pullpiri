@@ -150,18 +150,35 @@ pub async fn probe_loop(desired_states_cache: Arc<Mutex<HashMap<String, DesiredS
                 }
             }
 
+            // Build probe description and pod name for logging.
+            let pod_name = desired.pod_name.clone();
+            let probe_desc = format_probe_desc(&liveness.probe_type);
+
+            println!(
+                "[Probe] Checking liveness probe for container '{}'",
+                pod_name
+            );
+
             // Execute the liveness probe.
             let success = check_liveness_probe(container_id, liveness).await;
             probe_state.last_probe_at = Some(now);
 
             if success {
+                println!(
+                    "[Probe] Liveness probe for container '{}': {} - Success",
+                    pod_name, probe_desc
+                );
                 probe_state.failure_count = 0;
             } else {
                 probe_state.failure_count = probe_state.failure_count.saturating_add(1);
+                eprintln!(
+                    "[Probe] Liveness probe failed ({}/{})",
+                    probe_state.failure_count, liveness.failure_threshold
+                );
                 if probe_state.failure_count >= liveness.failure_threshold {
-                    eprintln!(
-                        "[Probe] Liveness probe failed {} time(s) for container '{}'; stopping container",
-                        probe_state.failure_count, container_id
+                    println!(
+                        "[NodeAgent] Stopping container '{}' due to liveness probe failure",
+                        pod_name
                     );
                     stop_container(container_id).await;
                     probe_states.remove(container_id);
@@ -190,6 +207,15 @@ pub async fn check_liveness_probe(container_id: &str, liveness: &LivenessProbe) 
         ProbeType::Exec { command } => {
             checker::check_exec(container_id, command, liveness.timeout_seconds).await
         }
+    }
+}
+
+/// Returns a human-readable description of the probe type for log messages.
+fn format_probe_desc(probe_type: &ProbeType) -> String {
+    match probe_type {
+        ProbeType::Http { path, port } => format!("HTTP GET {} on port {}", path, port),
+        ProbeType::Tcp { port } => format!("TCP port {}", port),
+        ProbeType::Exec { command } => format!("Exec {:?}", command),
     }
 }
 
@@ -314,6 +340,31 @@ mod tests {
             timeout_seconds: 1,
             failure_threshold: 3,
         }
+    }
+
+    // ── format_probe_desc ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_probe_desc_http() {
+        let desc = format_probe_desc(&ProbeType::Http {
+            path: "/health".to_string(),
+            port: 8080,
+        });
+        assert_eq!(desc, "HTTP GET /health on port 8080");
+    }
+
+    #[test]
+    fn test_format_probe_desc_tcp() {
+        let desc = format_probe_desc(&ProbeType::Tcp { port: 6379 });
+        assert_eq!(desc, "TCP port 6379");
+    }
+
+    #[test]
+    fn test_format_probe_desc_exec() {
+        let desc = format_probe_desc(&ProbeType::Exec {
+            command: vec!["cat".to_string(), "/tmp/healthy".to_string()],
+        });
+        assert!(desc.contains("cat") && desc.contains("/tmp/healthy"));
     }
 
     // ── parse_rfc3339 ────────────────────────────────────────────────────────
