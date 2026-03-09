@@ -19,8 +19,11 @@ fn extract_pod_name(pod_yaml: &str) -> Result<String, Box<dyn std::error::Error>
 }
 
 /// Convert a common crate ProbeConfig into a nodeagent DesiredState ProbeConfig.
+///
+/// Returns `None` if the liveness probe configuration has no recognized probe type
+/// (i.e., no `http`, `tcp`, or `exec` field), as this would be a configuration error.
 fn convert_probe_config(common_probe: &common::spec::k8s::pod::ProbeConfig) -> Option<ProbeConfig> {
-    let liveness = common_probe.liveness.as_ref().map(|lp| {
+    let liveness = common_probe.liveness.as_ref().and_then(|lp| {
         let probe_type = if let Some(http) = &lp.http {
             ProbeType::Http {
                 path: http.path.clone(),
@@ -33,20 +36,19 @@ fn convert_probe_config(common_probe: &common::spec::k8s::pod::ProbeConfig) -> O
                 command: exec.command.clone(),
             }
         } else {
-            // Default to HTTP on port 80 if no probe type specified
-            ProbeType::Http {
-                path: "/".to_string(),
-                port: 80,
-            }
+            eprintln!(
+                "[NodeAgent] Liveness probe configuration has no probe type (http/tcp/exec); ignoring"
+            );
+            return None;
         };
 
-        LivenessProbe {
+        Some(LivenessProbe {
             probe_type,
             initial_delay_seconds: lp.initialDelaySeconds,
             period_seconds: lp.periodSeconds,
             timeout_seconds: lp.timeoutSeconds,
             failure_threshold: lp.failureThreshold,
-        }
+        })
     });
 
     Some(ProbeConfig { liveness })

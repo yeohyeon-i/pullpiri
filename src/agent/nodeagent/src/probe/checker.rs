@@ -18,7 +18,10 @@ pub async fn check_http(path: &str, port: u16, timeout_secs: u32) -> bool {
     let uri: Uri = match uri_str.parse() {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("[Probe] Invalid URI {}: {}", uri_str, e);
+            eprintln!(
+                "[Probe] Invalid HTTP probe URI '{}': {}. Check that 'path' starts with '/' and 'port' is a valid port number (1-65535).",
+                uri_str, e
+            );
             return false;
         }
     };

@@ -52,7 +52,7 @@ pub async fn probe_loop(desired_states_cache: Arc<Mutex<HashMap<String, DesiredS
                 .filter(|c| c.State == "running")
                 .collect::<Vec<_>>(),
             Err(e) => {
-                eprintln!("[Probe] Failed to list containers: {:?}", e);
+                eprintln!("[Probe] Failed to list containers: {}", e);
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -125,13 +125,17 @@ pub async fn probe_loop(desired_states_cache: Arc<Mutex<HashMap<String, DesiredS
             // Update the timestamp of the last probe execution.
             probe_state.last_probe_at = Some(now);
 
+            let previous_count = failure_counts.get(container_id).copied().unwrap_or(0);
+
             if success {
-                // Reset failure count on success.
+                // Log only on state transition from failing to healthy.
+                if previous_count > 0 {
+                    println!(
+                        "[Probe] Liveness probe for container {} recovered (was {} failures)",
+                        container_id, previous_count
+                    );
+                }
                 failure_counts.insert(container_id.clone(), 0);
-                println!(
-                    "[Probe] Liveness probe for container {} succeeded",
-                    container_id
-                );
             } else {
                 let count = failure_counts.entry(container_id.clone()).or_insert(0);
                 *count += 1;
