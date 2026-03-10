@@ -319,13 +319,11 @@ pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String,
                                 pod_name, state.container_id, new_id
                             );
                             // Move backoff state to the new container ID and clear the old one.
-                            let old_state = {
+                            {
                                 let mut states = backoff_states.lock().await;
-                                states.remove(&state.container_id)
-                            };
-                            if let Some(bs) = old_state {
-                                let mut states = backoff_states.lock().await;
-                                states.insert(new_id.clone(), bs);
+                                if let Some(bs) = states.remove(&state.container_id) {
+                                    states.insert(new_id.clone(), bs);
+                                }
                             }
                             state.container_id = new_id;
                         }
@@ -506,7 +504,8 @@ async fn handle_exited_container(
     // Attempt restart via Podman.
     eprintln!(
         "[Reconciliation] Container '{}': restarting (attempt #{})",
-        desired.container_id, backoff_state.restart_count
+        desired.container_id,
+        backoff_state.restart_count + 1
     );
 
     let restart_path = format!("/v4.0.0/libpod/containers/{}/restart", desired.container_id);
@@ -1010,9 +1009,9 @@ spec:
 
         let backoff_states = make_backoff_states();
         // Seed a state where the last restart was 301 seconds ago (backoff expired).
-        let past = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(301))
-            .unwrap();
+        // Use UNIX_EPOCH + a fixed offset to avoid any risk of SystemTime underflow.
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 - 301);
         {
             let mut states = backoff_states.lock().await;
             states.insert(
