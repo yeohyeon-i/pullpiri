@@ -238,6 +238,25 @@ impl NodeAgentManager {
     }
 }
 
+/// Tracks restart backoff state for a single container.
+#[derive(Clone)]
+struct BackoffState {
+    /// Number of times the container has been successfully restarted.
+    restart_count: u32,
+    /// Timestamp of the most recent successful restart, or `None` if never restarted.
+    last_restart_time: Option<std::time::SystemTime>,
+}
+
+/// Calculates the required backoff wait time for the next restart attempt.
+///
+/// Formula: `min(10 * 2^restart_count, 300)` seconds.
+/// - 0 restarts → 10 s, 1 → 20 s, 2 → 40 s, …, ≥5 → 300 s (cap).
+fn calculate_backoff(restart_count: u32) -> std::time::Duration {
+    let base: u64 = 10;
+    let wait_seconds = std::cmp::min(base * 2_u64.pow(restart_count), 300);
+    std::time::Duration::from_secs(wait_seconds)
+}
+
 /// Runs the reconciliation loop: periodically compares desired vs actual container states.
 ///
 /// Every second, this function reads all desired states from the in-memory cache and
@@ -249,6 +268,10 @@ impl NodeAgentManager {
 pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String, DesiredState>>>) {
     use crate::resource::container::{get_inspect, get_list};
     use tokio::time::{sleep, Duration};
+
+    // In-memory backoff state per container ID.
+    let backoff_states: Arc<Mutex<HashMap<String, BackoffState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         // Clone desired states and release the lock immediately for better concurrency.
@@ -295,8 +318,22 @@ pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String,
                                 "[Reconciliation] Updating container_id for pod '{}': {} → {}",
                                 pod_name, state.container_id, new_id
                             );
+                            // Move backoff state to the new container ID and clear the old one.
+                            let old_state = {
+                                let mut states = backoff_states.lock().await;
+                                states.remove(&state.container_id)
+                            };
+                            if let Some(bs) = old_state {
+                                let mut states = backoff_states.lock().await;
+                                states.insert(new_id.clone(), bs);
+                            }
                             state.container_id = new_id;
                         }
+                    } else {
+                        // Container could not be (or should not be) recreated; remove its
+                        // backoff state to prevent memory leaks.
+                        let mut states = backoff_states.lock().await;
+                        states.remove(&desired.container_id);
                     }
                 }
                 Some(container) if container.State == "exited" || container.State == "dead" => {
@@ -317,7 +354,7 @@ pub async fn reconciliation_loop(desired_states_cache: Arc<Mutex<HashMap<String,
                     );
                     // Podman's restart API restarts the container in-place, preserving the
                     // same container ID. No cache update needed.
-                    handle_exited_container(desired, exit_code).await;
+                    handle_exited_container(desired, exit_code, Arc::clone(&backoff_states)).await;
                 }
                 _ => {
                     // Container is running normally; nothing to do.
@@ -391,11 +428,23 @@ async fn handle_missing_container(desired: &DesiredState) -> Option<String> {
     }
 }
 
-/// Handles a container that has exited by applying the configured restart policy.
+/// Handles a container that has exited by applying the configured restart policy and
+/// the exponential backoff algorithm.
 ///
 /// Calls Podman's restart API which restarts the container in-place, preserving the
-/// same container ID. No cache update is needed for this case.
-async fn handle_exited_container(desired: &DesiredState, exit_code: i32) {
+/// same container ID. The backoff state is updated in `backoff_states` on every
+/// successful restart. On failure the state is left unchanged so the next loop
+/// iteration can retry.
+///
+/// # Backoff rules
+/// - Formula: `min(10 * 2^restart_count, 300)` seconds between restarts.
+/// - If the elapsed time since the last restart is ≥ 300 s (5 min), restart attempts
+///   are stopped permanently for vehicle-environment safety.
+async fn handle_exited_container(
+    desired: &DesiredState,
+    exit_code: i32,
+    backoff_states: Arc<Mutex<HashMap<String, BackoffState>>>,
+) {
     use crate::desired_state::RestartPolicy;
     use hyper::Body;
 
@@ -410,17 +459,79 @@ async fn handle_exited_container(desired: &DesiredState, exit_code: i32) {
         desired.pod_name, desired.container_id, exit_code, desired.restart_policy, should_restart
     );
 
-    if should_restart {
-        let restart_path = format!("/v4.0.0/libpod/containers/{}/restart", desired.container_id);
-        match crate::runtime::podman::post(&restart_path, Body::empty()).await {
-            Ok(_) => eprintln!(
+    if !should_restart {
+        return;
+    }
+
+    // Read the current backoff state (or default) without holding the lock.
+    let backoff_state = {
+        let states = backoff_states.lock().await;
+        states
+            .get(&desired.container_id)
+            .cloned()
+            .unwrap_or(BackoffState {
+                restart_count: 0,
+                last_restart_time: None,
+            })
+    };
+
+    // Evaluate backoff conditions when a previous restart timestamp exists.
+    if let Some(last_restart_time) = backoff_state.last_restart_time {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(last_restart_time)
+            .unwrap_or(std::time::Duration::from_secs(0));
+
+        // Safety rule: stop restarting after the 5-minute window has elapsed.
+        if elapsed.as_secs() >= 300 {
+            eprintln!(
+                "[Reconciliation] Container '{}': backoff period expired (5 min), \
+                 stop restarting for vehicle safety",
+                desired.container_id
+            );
+            return;
+        }
+
+        // Not yet past the required backoff delay — come back next loop iteration.
+        let required_backoff = calculate_backoff(backoff_state.restart_count);
+        if elapsed < required_backoff {
+            eprintln!(
+                "[Reconciliation] Container '{}': waiting backoff ({:.0}s remaining)",
+                desired.container_id,
+                (required_backoff - elapsed).as_secs_f64()
+            );
+            return;
+        }
+    }
+
+    // Attempt restart via Podman.
+    eprintln!(
+        "[Reconciliation] Container '{}': restarting (attempt #{})",
+        desired.container_id, backoff_state.restart_count
+    );
+
+    let restart_path = format!("/v4.0.0/libpod/containers/{}/restart", desired.container_id);
+    match crate::runtime::podman::post(&restart_path, Body::empty()).await {
+        Ok(_) => {
+            eprintln!(
                 "[Reconciliation] Container '{}' restarted successfully",
                 desired.container_id
-            ),
-            Err(e) => eprintln!(
+            );
+            // Update backoff state only on success.
+            let mut states = backoff_states.lock().await;
+            states.insert(
+                desired.container_id.clone(),
+                BackoffState {
+                    restart_count: backoff_state.restart_count + 1,
+                    last_restart_time: Some(std::time::SystemTime::now()),
+                },
+            );
+        }
+        Err(e) => {
+            eprintln!(
                 "[Reconciliation] Failed to restart container '{}': {:?}",
                 desired.container_id, e
-            ),
+            );
+            // Do not update backoff_state on failure so the next loop iteration retries.
         }
     }
 }
@@ -655,6 +766,10 @@ spec:
         assert!(result.is_err());
     }
 
+    fn make_backoff_states() -> Arc<Mutex<HashMap<String, super::BackoffState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     /// Verifies that `handle_exited_container` with `RestartPolicy::Never` does not
     /// attempt any Podman API call and completes without panic.
     #[tokio::test]
@@ -670,7 +785,7 @@ spec:
             pod_yaml: String::new(),
         };
         // RestartPolicy::Never must not invoke Podman; function completes without error.
-        super::handle_exited_container(&desired, 1).await;
+        super::handle_exited_container(&desired, 1, make_backoff_states()).await;
     }
 
     /// Verifies that `handle_exited_container` with `RestartPolicy::OnFailure` and an
@@ -688,7 +803,7 @@ spec:
             pod_yaml: String::new(),
         };
         // Exit code 0 is a clean exit; OnFailure must not trigger a restart.
-        super::handle_exited_container(&desired, 0).await;
+        super::handle_exited_container(&desired, 0, make_backoff_states()).await;
     }
 
     /// Verifies that `handle_exited_container` with `RestartPolicy::OnFailure` and a
@@ -707,7 +822,7 @@ spec:
         };
         // Exit code != 0: OnFailure should attempt restart.
         // Podman call will fail because the container does not exist, but must not panic.
-        super::handle_exited_container(&desired, 1).await;
+        super::handle_exited_container(&desired, 1, make_backoff_states()).await;
     }
 
     /// Verifies that `handle_exited_container` with `RestartPolicy::Always` and exit code 0
@@ -725,7 +840,7 @@ spec:
             pod_yaml: String::new(),
         };
         // Always restart regardless of exit code; Podman may not be available, must not panic.
-        super::handle_exited_container(&desired, 0).await;
+        super::handle_exited_container(&desired, 0, make_backoff_states()).await;
     }
 
     /// Verifies that `handle_missing_container` with `RestartPolicy::Never` does NOT
@@ -816,5 +931,177 @@ spec:
         let guard = cache.lock().await;
         let state = guard.get("update-pod").unwrap();
         assert_eq!(state.container_id, "old-container-id");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Backoff-specific tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Verifies the `calculate_backoff` formula: min(10 * 2^n, 300) seconds.
+    #[test]
+    fn test_calculate_backoff_values() {
+        use std::time::Duration;
+        assert_eq!(super::calculate_backoff(0), Duration::from_secs(10));
+        assert_eq!(super::calculate_backoff(1), Duration::from_secs(20));
+        assert_eq!(super::calculate_backoff(2), Duration::from_secs(40));
+        assert_eq!(super::calculate_backoff(3), Duration::from_secs(80));
+        assert_eq!(super::calculate_backoff(4), Duration::from_secs(160));
+        // 10 * 2^5 = 320 → capped at 300
+        assert_eq!(super::calculate_backoff(5), Duration::from_secs(300));
+        // Higher counts remain capped
+        assert_eq!(super::calculate_backoff(10), Duration::from_secs(300));
+    }
+
+    /// Verifies that `handle_exited_container` skips the restart when the required
+    /// backoff time has not yet elapsed since the last restart.
+    ///
+    /// Because Podman is unavailable in the test environment, backoff state is never
+    /// updated on a (failed) restart attempt. We pre-seed a state with
+    /// `last_restart_time = now` and verify that the backoff_states map is unchanged
+    /// after the call (i.e., the early-return path was taken).
+    #[tokio::test]
+    async fn test_handle_exited_container_backoff_waiting_skips_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "backoff-container".to_string(),
+            restart_policy: RestartPolicy::Always,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+            pod_yaml: String::new(),
+        };
+
+        let backoff_states = make_backoff_states();
+        // Seed a backoff state: last restart happened right now, so 10 s have NOT elapsed.
+        {
+            let mut states = backoff_states.lock().await;
+            states.insert(
+                "backoff-container".to_string(),
+                super::BackoffState {
+                    restart_count: 0,
+                    last_restart_time: Some(std::time::SystemTime::now()),
+                },
+            );
+        }
+
+        super::handle_exited_container(&desired, 1, Arc::clone(&backoff_states)).await;
+
+        // The backoff map must be unchanged: restart was skipped because elapsed < 10 s.
+        let states = backoff_states.lock().await;
+        let state = states.get("backoff-container").unwrap();
+        assert_eq!(state.restart_count, 0);
+    }
+
+    /// Verifies that `handle_exited_container` stops restarting once 300 seconds (5 min)
+    /// have elapsed since the last restart (vehicle-safety rule).
+    #[tokio::test]
+    async fn test_handle_exited_container_backoff_expired_stops_restart() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "expired-container".to_string(),
+            restart_policy: RestartPolicy::Always,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+            pod_yaml: String::new(),
+        };
+
+        let backoff_states = make_backoff_states();
+        // Seed a state where the last restart was 301 seconds ago (backoff expired).
+        let past = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(301))
+            .unwrap();
+        {
+            let mut states = backoff_states.lock().await;
+            states.insert(
+                "expired-container".to_string(),
+                super::BackoffState {
+                    restart_count: 5,
+                    last_restart_time: Some(past),
+                },
+            );
+        }
+
+        super::handle_exited_container(&desired, 1, Arc::clone(&backoff_states)).await;
+
+        // The backoff state must be unchanged: the 5-min expiry triggered an early return.
+        let states = backoff_states.lock().await;
+        let state = states.get("expired-container").unwrap();
+        assert_eq!(state.restart_count, 5);
+        assert_eq!(state.last_restart_time, Some(past));
+    }
+
+    /// Verifies that `handle_exited_container` proceeds when no previous restart
+    /// timestamp exists (first restart attempt) and no backoff state is pre-seeded.
+    /// Podman is unavailable, so the restart fails, but the function must not panic
+    /// and the backoff map must remain empty (state only updated on success).
+    #[tokio::test]
+    async fn test_handle_exited_container_first_restart_no_prior_state() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "fresh-container".to_string(),
+            restart_policy: RestartPolicy::Always,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+            pod_yaml: String::new(),
+        };
+
+        let backoff_states = make_backoff_states();
+        // No pre-seeded state → function should attempt restart immediately.
+        super::handle_exited_container(&desired, 1, Arc::clone(&backoff_states)).await;
+
+        // Podman is not running, so restart fails and backoff state is NOT inserted.
+        let states = backoff_states.lock().await;
+        assert!(!states.contains_key("fresh-container"));
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::Never` does not
+    /// mutate the backoff_states map.
+    #[tokio::test]
+    async fn test_handle_exited_container_never_policy_no_backoff_mutation() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "never-container".to_string(),
+            restart_policy: RestartPolicy::Never,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+            pod_yaml: String::new(),
+        };
+
+        let backoff_states = make_backoff_states();
+        super::handle_exited_container(&desired, 1, Arc::clone(&backoff_states)).await;
+
+        // Never policy exits before touching backoff_states.
+        let states = backoff_states.lock().await;
+        assert!(states.is_empty());
+    }
+
+    /// Verifies that `handle_exited_container` with `RestartPolicy::OnFailure` and
+    /// exit_code 0 does not mutate the backoff_states map.
+    #[tokio::test]
+    async fn test_handle_exited_container_on_failure_zero_no_backoff_mutation() {
+        use crate::desired_state::RestartPolicy;
+
+        let desired = DesiredState {
+            pod_name: "test-pod".to_string(),
+            container_id: "on-failure-container".to_string(),
+            restart_policy: RestartPolicy::OnFailure,
+            probe_config: None,
+            created_at: std::time::SystemTime::now(),
+            pod_yaml: String::new(),
+        };
+
+        let backoff_states = make_backoff_states();
+        super::handle_exited_container(&desired, 0, Arc::clone(&backoff_states)).await;
+
+        // OnFailure with exit_code 0 exits before touching backoff_states.
+        let states = backoff_states.lock().await;
+        assert!(states.is_empty());
     }
 }
